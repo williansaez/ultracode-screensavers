@@ -16,3 +16,5 @@ live/
 # Local/gerado
 .claude/
 screensaver/*.saver/Contents/_CodeSignature/
+screensaver/*_test/clocktest
+screensaver/*_test/*_check
