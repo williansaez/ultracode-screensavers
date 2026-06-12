@@ -31,6 +31,44 @@ func snapshot(_ view: NSView, to path: String) {
     print("wrote \(path)")
 }
 
+// Perf mode (CLOCK_PERF=1): pump sim + offscreen draw 60 times and print the
+// average ms/frame. Pitch comes from prefs — set it to 8 first, e.g.:
+//   defaults -currentHost write com.williansaez.ultracode-clock pitch -float 8
+if ProcessInfo.processInfo.environment["CLOCK_PERF"] != nil {
+    guard let pv = UltracodeClockView(frame: NSRect(origin: .zero, size: size),
+                                      isPreview: false) else {
+        fatalError("failed to create view")
+    }
+    pv.debugSetTime(10, 58, colonOn: true)
+    guard let rep = NSBitmapImageRep(
+        bitmapDataPlanes: nil,
+        pixelsWide: Int(size.width), pixelsHigh: Int(size.height),
+        bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+        colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+    ), let gctx = NSGraphicsContext(bitmapImageRep: rep) else {
+        fatalError("failed to create bitmap context")
+    }
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = gctx
+    for _ in 0..<5 {                       // warm-up (includes grid build)
+        pv.animateOneFrame()
+        pv.draw(pv.bounds)
+    }
+    let t0 = CFAbsoluteTimeGetCurrent()
+    for frame in 0..<60 {
+        if frame == 20 {                   // mid-run minute change: worst case
+            pv.debugSetTime(10, 59, colonOn: true)
+        }
+        pv.animateOneFrame()
+        pv.draw(pv.bounds)
+    }
+    let elapsed = CFAbsoluteTimeGetCurrent() - t0
+    NSGraphicsContext.restoreGraphicsState()
+    print(String(format: "perf: %.2f ms/frame avg (60 frames, sim+draw)",
+                 elapsed / 60 * 1000))
+    exit(0)
+}
+
 guard let view = UltracodeClockView(frame: NSRect(origin: .zero, size: size),
                                     isPreview: false) else {
     fatalError("failed to create view")

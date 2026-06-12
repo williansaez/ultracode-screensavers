@@ -35,6 +35,41 @@ guard let view = UltracodeLifeView(frame: NSRect(origin: .zero, size: size),
                                    isPreview: false) else {
     fatalError("failed to create view")
 }
+
+// Perf mode (LIFE_PERF=1): pump sim + offscreen draw 60x, print avg ms/frame.
+// Set the pitch pref BEFORE launching (defaults -currentHost write ...).
+// The offscreen target mimics the deployed window backing store: Retina
+// scale, BGRA little-endian, sRGB.
+if ProcessInfo.processInfo.environment["LIFE_PERF"] == "1" {
+    let scale = 2
+    guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+          let cg = CGContext(
+              data: nil,
+              width: Int(size.width) * scale, height: Int(size.height) * scale,
+              bitsPerComponent: 8, bytesPerRow: 0, space: space,
+              bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+                  | CGBitmapInfo.byteOrder32Little.rawValue)
+    else {
+        fatalError("failed to create perf bitmap context")
+    }
+    cg.scaleBy(x: CGFloat(scale), y: CGFloat(scale))
+    let gctx = NSGraphicsContext(cgContext: cg, flipped: false)
+    view.animateOneFrame()   // warm up: build grid + floor image
+    let frames = 60
+    let t0 = CFAbsoluteTimeGetCurrent()
+    for _ in 0..<frames {
+        view.animateOneFrame()
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = gctx
+        view.draw(view.bounds)
+        gctx.flushGraphics()
+        NSGraphicsContext.restoreGraphicsState()
+    }
+    let dt = CFAbsoluteTimeGetCurrent() - t0
+    print(String(format: "perf: %.2f ms/frame avg over %d frames",
+                 dt * 1000 / Double(frames), frames))
+    exit(0)
+}
 for gen in 1...120 {
     view.animateOneFrame()
     if gen == 2 { snapshot(view, to: "\(outDir)/life_g2.png") }

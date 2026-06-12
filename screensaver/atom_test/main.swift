@@ -14,6 +14,29 @@ func snapshot(_ view: NSView, to path: String) {
     try! rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: path)); print("wrote \(path)")
 }
 
+// Timing mode (ATOM_TIMING=1): pump sim + offscreen draw 60x, print avg
+// ms/frame. Set the pitch pref beforehand (e.g. 8) via `defaults`.
+if ProcessInfo.processInfo.environment["ATOM_TIMING"] != nil {
+    guard let v = UltracodeAtomView(frame: NSRect(origin: .zero, size: size), isPreview: false) else { fatalError() }
+    guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(size.width), pixelsHigh: Int(size.height), bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0), let g = NSGraphicsContext(bitmapImageRep: rep) else { fatalError("ctx") }
+    // Warm-up: grid + floor image build, plus a few sim frames for trails.
+    for _ in 0..<120 { v.animateOneFrame() }
+    NSGraphicsContext.saveGraphicsState(); NSGraphicsContext.current = g
+    v.draw(v.bounds)
+    NSGraphicsContext.restoreGraphicsState()
+    var total = 0.0
+    for _ in 0..<60 {
+        let t0 = CFAbsoluteTimeGetCurrent()
+        v.animateOneFrame()
+        NSGraphicsContext.saveGraphicsState(); NSGraphicsContext.current = g
+        v.draw(v.bounds)
+        NSGraphicsContext.restoreGraphicsState()
+        total += CFAbsoluteTimeGetCurrent() - t0
+    }
+    print(String(format: "avg sim+draw: %.3f ms/frame", total / 60 * 1000))
+    exit(0)
+}
+
 guard let view = UltracodeAtomView(frame: NSRect(origin: .zero, size: size), isPreview: false) else { fatalError() }
 
 // 30 fps: 5 s = 150 frames.

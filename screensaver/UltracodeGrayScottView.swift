@@ -103,7 +103,29 @@ public final class UltracodeGrayScottView: ScreenSaverView {
     private var originY: CGFloat = 0
 
     private var levelColors: [NSColor] = []
+    private var levelCGColors: [CGColor] = []
     private let colorLevels = 32
+
+    /// Quantized level the empty floor maps to; cells at this level are
+    /// covered by the pre-rendered floor blit and skipped during draw.
+    private var floorLevelIndex = 0
+
+    /// Pre-rendered empty lattice (background gradient + every cell at the
+    /// floor color), built once per rebuildGrid() and blitted each frame.
+    private var floorImage: CGImage?
+
+    /// One pre-rendered rounded-rect cell per quantized color level, built at
+    /// the window's backing scale. Dynamic cells are drawn by blitting these
+    /// (grouped per level) instead of filling one vector path per cell:
+    /// CoreGraphics blits small images far faster than it rasterizes
+    /// thousands of rounded-rect paths.
+    private var levelSprites: [CGImage] = []
+    /// Side of a sprite's destination rect in points (cellSide + AA margin,
+    /// rounded up to an integral pixel count at the backing scale).
+    private var spriteSide: CGFloat = 0
+    /// Backing scale the sprites were rendered at; destination rects are
+    /// snapped to this pixel grid so blits stay 1:1 (no resampling).
+    private var spriteScale: CGFloat = 2
 
     // MARK: - Gray-Scott reaction-diffusion
 
@@ -200,8 +222,84 @@ public final class UltracodeGrayScottView: ScreenSaverView {
             let b = f + (1 - f) * CGFloat(l) / CGFloat(colorLevels - 1)
             return ramp(b, stops: stops).color
         }
+        levelCGColors = levelColors.map(\.cgColor)
+        // Same quantization as draw(_:) applied to brightness b == f.
+        floorLevelIndex = min(colorLevels - 1, Int(f * CGFloat(colorLevels - 1)))
+        rebuildLevelSprites()
+        rebuildFloorImage()
 
         reseed()
+    }
+
+    /// Pre-render one cell (rounded rect, same geometry as drawCell) per
+    /// quantized color level at the backing scale.
+    private func rebuildLevelSprites() {
+        levelSprites = []
+        spriteSide = 0
+        guard !levelCGColors.isEmpty, cellSide > 0 else { return }
+        let scale = window?.backingScaleFactor ?? 2
+        spriteScale = scale
+        // 1 pt of margin on each side so antialiased edges are not clipped;
+        // integral pixel count so blits at the backing scale stay 1:1.
+        let px = Int(((cellSide + 2) * scale).rounded(.up))
+        spriteSide = CGFloat(px) / scale
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB) else { return }
+        let cellRect = CGRect(x: -cellSide / 2, y: -cellSide / 2,
+                              width: cellSide, height: cellSide)
+        let template = CGPath(roundedRect: cellRect,
+                              cornerWidth: cellSide * 0.28,
+                              cornerHeight: cellSide * 0.28, transform: nil)
+        var sprites: [CGImage] = []
+        sprites.reserveCapacity(colorLevels)
+        for level in 0..<colorLevels {
+            guard let c = CGContext(data: nil, width: px, height: px,
+                                    bitsPerComponent: 8, bytesPerRow: 0,
+                                    space: space,
+                                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+            else { return }
+            c.scaleBy(x: scale, y: scale)
+            c.translateBy(x: spriteSide / 2, y: spriteSide / 2)
+            c.setFillColor(levelCGColors[level])
+            c.addPath(template)
+            c.fillPath()
+            guard let img = c.makeImage() else { return }
+            sprites.append(img)
+        }
+        levelSprites = sprites
+    }
+
+    /// Render the entire empty lattice (background gradient + floor cells)
+    /// once into a Retina-scale CGImage; draw(_:) blits it every frame
+    /// instead of filling thousands of floor cells individually.
+    private func rebuildFloorImage() {
+        floorImage = nil
+        guard cols > 0, rows > 0, levelSprites.count == colorLevels else { return }
+        let scale = window?.backingScaleFactor ?? 2
+        let pw = Int((bounds.width * scale).rounded())
+        let ph = Int((bounds.height * scale).rounded())
+        guard pw > 0, ph > 0,
+              let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let ctx = CGContext(data: nil, width: pw, height: ph,
+                                  bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: space,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return }
+        ctx.scaleBy(x: scale, y: scale)
+        drawBackground(ctx)
+        let sprite = levelSprites[floorLevelIndex]
+        let half = spriteSide / 2
+        let s = spriteScale
+        for j in 0..<rows {
+            let cy = originY + CGFloat(j) * pitch
+            for i in 0..<cols {
+                let cx = originX + CGFloat(i) * pitch
+                let x = ((cx - half) * s).rounded() / s
+                let y = ((cy - half) * s).rounded() / s
+                ctx.draw(sprite, in: CGRect(x: x, y: y,
+                                            width: spriteSide, height: spriteSide))
+            }
+        }
+        floorImage = ctx.makeImage()
     }
 
     private func reseed() {
@@ -258,26 +356,37 @@ public final class UltracodeGrayScottView: ScreenSaverView {
 
     private func stepSim() {
         let F = paramF, K = paramK, Du = diffU, Dv = diffV
-        for j in 0..<fh {
-            let jm = (j == 0 ? fh - 1 : j - 1) * fw
-            let j0 = j * fw
-            let jp = (j == fh - 1 ? 0 : j + 1) * fw
-            for i in 0..<fw {
-                let im = i == 0 ? fw - 1 : i - 1
-                let ip = i == fw - 1 ? 0 : i + 1
-                let idx = j0 + i
-                let uc = fieldU[idx]
-                let vc = fieldV[idx]
-                let lapU = fieldU[jm + i] + fieldU[jp + i]
-                         + fieldU[j0 + im] + fieldU[j0 + ip] - 4 * uc
-                let lapV = fieldV[jm + i] + fieldV[jp + i]
-                         + fieldV[j0 + im] + fieldV[j0 + ip] - 4 * vc
-                let uvv = uc * vc * vc
-                // dt = 1
-                let nu = uc + (Du * lapU - uvv + F * (1 - uc))
-                let nv = vc + (Dv * lapV + uvv - (F + K) * vc)
-                nextU[idx] = min(1, max(0, nu))
-                nextV[idx] = min(1, max(0, nv))
+        let fw = self.fw, fh = self.fh
+        // Unsafe buffers drop bounds/COW checks in the hot loop; the
+        // arithmetic and traversal are identical to the straightforward form.
+        fieldU.withUnsafeBufferPointer { u in
+            fieldV.withUnsafeBufferPointer { v in
+                nextU.withUnsafeMutableBufferPointer { nu in
+                    nextV.withUnsafeMutableBufferPointer { nv in
+                        for j in 0..<fh {
+                            let jm = (j == 0 ? fh - 1 : j - 1) * fw
+                            let j0 = j * fw
+                            let jp = (j == fh - 1 ? 0 : j + 1) * fw
+                            for i in 0..<fw {
+                                let im = i == 0 ? fw - 1 : i - 1
+                                let ip = i == fw - 1 ? 0 : i + 1
+                                let idx = j0 + i
+                                let uc = u[idx]
+                                let vc = v[idx]
+                                let lapU = u[jm + i] + u[jp + i]
+                                         + u[j0 + im] + u[j0 + ip] - 4 * uc
+                                let lapV = v[jm + i] + v[jp + i]
+                                         + v[j0 + im] + v[j0 + ip] - 4 * vc
+                                let uvv = uc * vc * vc
+                                // dt = 1
+                                let nuv = uc + (Du * lapU - uvv + F * (1 - uc))
+                                let nvv = vc + (Dv * lapV + uvv - (F + K) * vc)
+                                nu[idx] = min(1, max(0, nuv))
+                                nv[idx] = min(1, max(0, nvv))
+                            }
+                        }
+                    }
+                }
             }
         }
         swap(&fieldU, &nextU)
@@ -342,11 +451,28 @@ public final class UltracodeGrayScottView: ScreenSaverView {
     public override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
         if fieldV.isEmpty { rebuildGrid() }
+        if floorImage == nil { rebuildFloorImage() }
 
-        drawBackground(ctx)
+        // 1) Blit the pre-rendered empty lattice (gradient + floor cells).
+        if let floorImage {
+            ctx.draw(floorImage, in: bounds)
+        } else {
+            drawBackground(ctx)
+        }
+        guard levelSprites.count == colorLevels else { return }
 
         let block = Float(simScale * simScale)
         let f = CGFloat(config.floor)
+
+        // 2) Group non-floor cells by quantized color level and draw each
+        //    group by blitting that level's pre-rendered cell sprite — far
+        //    cheaper than rasterizing one rounded-rect path per cell. Cells
+        //    at the floor level are skipped (the blit already shows them).
+        //    Bloomed cells are collected and drawn individually on top (they
+        //    are few and need the shadow).
+        var levelCells = [[CGPoint]](repeating: [], count: colorLevels)
+        var bloomCells: [(x: CGFloat, y: CGFloat, level: Int)] = []
+
         for j in 0..<rows {
             let cy = originY + CGFloat(j) * pitch
             let by = j * simScale
@@ -362,10 +488,33 @@ public final class UltracodeGrayScottView: ScreenSaverView {
                 let b = max(f, min(1.0, CGFloat(vAvg) * 3.0))
                 let level = min(colorLevels - 1, Int(b * CGFloat(colorLevels - 1)))
                 let cx = originX + CGFloat(i) * pitch
-                drawCell(ctx, x: cx, y: cy,
-                         color: levelColors[level],
-                         bloom: config.bloom && vAvg > bloomThreshold)
+                if config.bloom && vAvg > bloomThreshold {
+                    bloomCells.append((cx, cy, level))
+                    continue
+                }
+                if level == floorLevelIndex { continue }  // floor blit shows it
+                levelCells[level].append(CGPoint(x: cx, y: cy))
             }
+        }
+
+        let half = spriteSide / 2
+        let s = spriteScale
+        for level in 0..<colorLevels {
+            let cells = levelCells[level]
+            if cells.isEmpty { continue }
+            let sprite = levelSprites[level]
+            for p in cells {
+                let x = ((p.x - half) * s).rounded() / s
+                let y = ((p.y - half) * s).rounded() / s
+                ctx.draw(sprite, in: CGRect(x: x, y: y,
+                                            width: spriteSide, height: spriteSide))
+            }
+        }
+
+        // 3) Bloomed peaks on top, exactly as before.
+        for cell in bloomCells {
+            drawCell(ctx, x: cell.x, y: cell.y,
+                     color: levelColors[cell.level], bloom: true)
         }
     }
 

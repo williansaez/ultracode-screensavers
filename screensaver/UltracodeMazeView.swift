@@ -116,6 +116,18 @@ public final class UltracodeMazeView: ScreenSaverView {
     private var accentColors: [NSColor] = []   // solution path (contrast accent)
     private let colorLevels = 32
 
+    /// Quantized level the empty "floor" brightness maps to; cells at this
+    /// level are covered by the pre-rendered floor blit and skipped in draw.
+    private var floorLevel = 0
+    /// Bg gradient + full empty lattice, pre-rendered once per rebuildGrid().
+    private var floorImage: CGImage?
+    /// One rounded-rect sprite per quantized color (ramp + accent banks),
+    /// stamped in draw(_:) when a single color level holds more cells than
+    /// spriteThreshold (compound-path fills scale poorly past ~1k subpaths).
+    private var cellSprites: [CGImage?] = []
+    private var spriteScale: CGFloat = 2
+    private static let spriteThreshold = 1024
+
     // MARK: - Maze state
     //
     // A classic odd lattice maze mapped onto the display cells: maze nodes sit
@@ -218,12 +230,12 @@ public final class UltracodeMazeView: ScreenSaverView {
         // at f = 0 the uncarved grid vanishes; at f >= 0.10 it sits on the
         // ramp exactly as before. Only the floor level is touched -- carved
         // passages (base >= 0.35) never map this low.
+        floorLevel = min(colorLevels - 1,
+                         max(0, Int(f * CGFloat(colorLevels - 1))))
         if f < 0.10 {
             let bgMid = RGB.lerp(bgTop, bgBottom, 0.5)
-            let floorLvl = min(colorLevels - 1,
-                               max(0, Int(f * CGFloat(colorLevels - 1))))
-            let onRamp = f + (1 - f) * CGFloat(floorLvl) / CGFloat(colorLevels - 1)
-            levelColors[floorLvl] =
+            let onRamp = f + (1 - f) * CGFloat(floorLevel) / CGFloat(colorLevels - 1)
+            levelColors[floorLevel] =
                 RGB.lerp(bgMid, ramp(onRamp, stops: stops), f / 0.10).color
         }
         let a = contrastAccent(forTheme: config.theme)
@@ -240,6 +252,86 @@ public final class UltracodeMazeView: ScreenSaverView {
 
         rngState = 0x243F6A8885A308D3 &+ UInt64(tick &* 2654435761) &+ 0x9E3779B97F4A7C15
         resetMaze()
+        rebuildFloorImage()
+        rebuildCellSprites()
+    }
+
+    /// Pre-render one cell sprite per quantized color at Retina scale.
+    /// Rebuilt with the grid so theme, pitch and floor changes stay live.
+    private func rebuildCellSprites() {
+        spriteScale = window?.backingScaleFactor ?? 2
+        cellSprites = .init(repeating: nil, count: colorLevels * 2)
+        let px = Int(ceil(cellSide * spriteScale))
+        guard px > 0, !levelColors.isEmpty,
+              let space = CGColorSpace(name: CGColorSpace.sRGB) else { return }
+        let corner = cellSide * 0.28
+        for key in 0..<(colorLevels * 2) {
+            guard let ctx = CGContext(data: nil, width: px, height: px,
+                                      bitsPerComponent: 8, bytesPerRow: 0,
+                                      space: space,
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+            else { continue }
+            ctx.scaleBy(x: spriteScale, y: spriteScale)
+            let color = key < colorLevels ? levelColors[key]
+                                          : accentColors[key - colorLevels]
+            ctx.setFillColor(color.cgColor)
+            ctx.addPath(CGPath(
+                roundedRect: CGRect(x: 0, y: 0,
+                                    width: cellSide, height: cellSide),
+                cornerWidth: corner, cornerHeight: corner, transform: nil))
+            ctx.fillPath()
+            cellSprites[key] = ctx.makeImage()
+        }
+    }
+
+    /// Pre-render the background gradient plus EVERY cell at the floor color
+    /// into a Retina-scale CGImage. draw(_:) blits it as the first step each
+    /// frame instead of filling thousands of floor cells. Rebuilt whenever
+    /// rebuildGrid() runs, so resize, theme and the "Brilho do fundo" slider
+    /// stay live.
+    private func rebuildFloorImage() {
+        floorImage = nil
+        let scale = window?.backingScaleFactor ?? 2
+        let pxW = Int((bounds.width * scale).rounded())
+        let pxH = Int((bounds.height * scale).rounded())
+        guard pxW > 0, pxH > 0, !levelColors.isEmpty,
+              let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let ctx = CGContext(data: nil, width: pxW, height: pxH,
+                                  bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: space,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return }
+        ctx.scaleBy(x: scale, y: scale)
+
+        // Same gradient as drawBackground(_:).
+        let colors = [bgTop.color.cgColor, bgBottom.color.cgColor] as CFArray
+        if let grad = CGGradient(colorsSpace: space, colors: colors, locations: [0, 1]) {
+            ctx.drawLinearGradient(grad,
+                                   start: CGPoint(x: 0, y: bounds.height),
+                                   end: CGPoint(x: 0, y: 0),
+                                   options: [])
+        } else {
+            ctx.setFillColor(bgTop.color.cgColor)
+            ctx.fill(CGRect(x: 0, y: 0, width: bounds.width, height: bounds.height))
+        }
+
+        let corner = cellSide * 0.28
+        let half = cellSide / 2
+        let lattice = CGMutablePath()
+        for j in 0..<rows {
+            let cy = originY + CGFloat(j) * pitch
+            for i in 0..<cols {
+                let cx = originX + CGFloat(i) * pitch
+                lattice.addPath(CGPath(
+                    roundedRect: CGRect(x: cx - half, y: cy - half,
+                                        width: cellSide, height: cellSide),
+                    cornerWidth: corner, cornerHeight: corner, transform: nil))
+            }
+        }
+        ctx.setFillColor(levelColors[floorLevel].cgColor)
+        ctx.addPath(lattice)
+        ctx.fillPath()
+        floorImage = ctx.makeImage()
     }
 
     private func nodeCell(_ mx: Int, _ my: Int) -> Int {
@@ -508,11 +600,30 @@ public final class UltracodeMazeView: ScreenSaverView {
     public override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
         if levelColors.isEmpty || base.count != cols * rows { rebuildGrid() }
+        if floorImage == nil { rebuildFloorImage() }
 
-        drawBackground(ctx)
+        // 1) Blit the pre-rendered floor (bg gradient + empty lattice); the
+        // per-cell loop below then skips every cell still at the floor level.
+        let skipFloor: Bool
+        if let floorImage {
+            ctx.draw(floorImage, in: bounds)
+            skipFloor = true
+        } else {
+            drawBackground(ctx)   // degenerate bounds: keep the old path
+            skipFloor = false
+        }
 
         let holding = phase == .holding
         let pulse = 0.84 + 0.13 * sin(pulsePhase)
+        let corner = cellSide * 0.28
+        let half = cellSide / 2
+
+        // 2) Group dynamic cells by quantized color (ramp bank
+        // 0..<colorLevels, accent bank colorLevels..<2*colorLevels).
+        // Bloomed cells are few and need the shadow, so they are drawn
+        // individually on top via drawCell().
+        var byColor = [[CGPoint]](repeating: [], count: colorLevels * 2)
+        var bloomCells: [(x: CGFloat, y: CGFloat, color: NSColor)] = []
 
         for j in 0..<rows {
             let cy = originY + CGFloat(j) * pitch
@@ -534,10 +645,55 @@ public final class UltracodeMazeView: ScreenSaverView {
                 }
                 let lvl = min(colorLevels - 1,
                               max(0, Int(b * CGFloat(colorLevels - 1))))
-                let cellColor = isPath[idx] ? accentColors[lvl] : levelColors[lvl]
-                drawCell(ctx, x: originX + CGFloat(i) * pitch, y: cy,
-                         color: cellColor, bloom: bloomCell)
+                let onPath = isPath[idx]
+                let cx = originX + CGFloat(i) * pitch
+                if bloomCell {
+                    bloomCells.append((cx, cy,
+                                       onPath ? accentColors[lvl] : levelColors[lvl]))
+                    continue
+                }
+                if skipFloor && !onPath && lvl == floorLevel { continue }
+                byColor[onPath ? colorLevels + lvl : lvl]
+                    .append(CGPoint(x: cx, y: cy))
             }
+        }
+
+        // 3) One fill per color level. Normal-sized groups build ONE
+        // compound CGPath and fill it with a single call (this covers every
+        // frame at the default pitch). Very large groups -- only possible at
+        // small pitch, e.g. ~5k carved cells sharing a level at pitch 8 --
+        // stamp a pre-rendered sprite instead: CG compound-path filling
+        // measured ~2.4 us/cell here vs ~0.45 us/cell for sprite blits,
+        // which is the difference between ~32 ms and <10 ms per frame.
+        for key in byColor.indices {
+            let pts = byColor[key]
+            if pts.isEmpty { continue }
+            if pts.count > Self.spriteThreshold, key < cellSprites.count,
+               let sprite = cellSprites[key] {
+                let w = CGFloat(sprite.width) / spriteScale
+                let h = CGFloat(sprite.height) / spriteScale
+                for p in pts {
+                    ctx.draw(sprite, in: CGRect(x: p.x - half, y: p.y - half,
+                                                width: w, height: h))
+                }
+            } else {
+                let batch = CGMutablePath()
+                for p in pts {
+                    batch.addPath(CGPath(
+                        roundedRect: CGRect(x: p.x - half, y: p.y - half,
+                                            width: cellSide, height: cellSide),
+                        cornerWidth: corner, cornerHeight: corner,
+                        transform: nil))
+                }
+                let color = key < colorLevels ? levelColors[key]
+                                              : accentColors[key - colorLevels]
+                ctx.setFillColor(color.cgColor)
+                ctx.addPath(batch)
+                ctx.fillPath()
+            }
+        }
+        for cell in bloomCells {
+            drawCell(ctx, x: cell.x, y: cell.y, color: cell.color, bloom: true)
         }
     }
 

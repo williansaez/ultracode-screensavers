@@ -106,6 +106,72 @@ public final class UltracodeNetworkView: ScreenSaverView {
     private var levelColors: [NSColor] = []
     private let colorLevels = 32
 
+    /// Empty lattice (bg gradient + every cell at floor brightness),
+    /// pre-rendered at Retina scale and blitted each frame.
+    private var floorImage: CGImage?
+
+    /// One pre-rendered sprite per quantized level brighter than the floor:
+    /// the plain rounded cell, plus (for levels >= bloomLevel) a variant with
+    /// the bloom halo baked in. drawCell's output is destination-independent
+    /// (source-over of a fixed RGBA patch), and cells never overlap each
+    /// other (side = 0.7 * pitch), so stamping the sprites composites the
+    /// same image as filling each path live — at a fraction of the cost.
+    private var cellSprites: [CGImage?] = []
+    private var cellSpriteSide: CGFloat = 0
+    private var bloomSprites: [CGImage?] = []
+    private var bloomSpriteSide: CGFloat = 0
+
+    /// Pixel scale floorImage/sprites were built at. draw() rebuilds them if
+    /// the destination context's device scale differs, so every blit is 1:1
+    /// (no per-frame resampling, no soft edges).
+    private var imageScale: CGFloat = 0
+
+    private func rebuildImages(scale: CGFloat) {
+        imageScale = scale
+        rebuildFloorImage(scale: scale)
+        rebuildCellSprites(scale: scale)
+        rebuildBloomSprites(scale: scale)
+    }
+
+    /// Renders one cell via drawCell() into a fresh sprite context.
+    private func makeSprite(side: CGFloat, scale: CGFloat, level: Int,
+                            bloom: Bool, space: CGColorSpace) -> CGImage? {
+        let px = max(1, Int((side * scale).rounded(.up)))
+        guard let ctx = CGContext(data: nil, width: px, height: px,
+                                  bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: space,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return nil }
+        ctx.scaleBy(x: scale, y: scale)
+        let ns = NSGraphicsContext(cgContext: ctx, flipped: false)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = ns
+        drawCell(ctx, x: side / 2, y: side / 2,
+                 color: levelColors[level], bloom: bloom)
+        NSGraphicsContext.restoreGraphicsState()
+        return ctx.makeImage()
+    }
+
+    /// Plain cell sprites for every level above the floor.
+    private func rebuildCellSprites(scale: CGFloat) {
+        cellSprites = .init(repeating: nil, count: colorLevels)
+        guard !levelColors.isEmpty,
+              let space = CGColorSpace(name: CGColorSpace.sRGB) else { return }
+        let px = max(1, Int(((cellSide + 2) * scale).rounded(.up)))
+        cellSpriteSide = CGFloat(px) / scale     // integral pixel size: 1:1 blits
+        for lvl in (floorLevelIndex + 1)..<colorLevels {
+            cellSprites[lvl] = makeSprite(side: cellSpriteSide, scale: scale,
+                                          level: lvl, bloom: false, space: space)
+        }
+    }
+
+    /// Quantized level of an empty cell: draw() computes b = max(f, 0) = f,
+    /// so the floor sits at Int(f * (levels-1)), not at level 0.
+    private var floorLevelIndex: Int {
+        let f = CGFloat(config.floor)
+        return min(colorLevels - 1, max(0, Int(f * CGFloat(colorLevels - 1))))
+    }
+
     // MARK: - Network state
 
     // Digital rain driven by real traffic: download spawns streams falling
@@ -241,6 +307,74 @@ public final class UltracodeNetworkView: ScreenSaverView {
 
         havePrev = false
         refreshRates()
+
+        rebuildImages(scale: window?.backingScaleFactor ?? 2)
+    }
+
+    /// Renders the empty lattice once (bg gradient + all cells at the floor
+    /// color) so draw() can blit it instead of filling thousands of paths.
+    /// Runs on every rebuildGrid(), so resize/theme/floor changes refresh it.
+    private func rebuildFloorImage(scale: CGFloat) {
+        floorImage = nil
+        let w = bounds.width, h = bounds.height
+        guard w >= 1, h >= 1, !levelColors.isEmpty,
+              let space = CGColorSpace(name: CGColorSpace.sRGB) else { return }
+        guard let ctx = CGContext(data: nil,
+                                  width: max(1, Int(w * scale)),
+                                  height: max(1, Int(h * scale)),
+                                  bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: space,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return }
+        ctx.scaleBy(x: scale, y: scale)
+
+        // Background gradient, same stops as drawBackground().
+        let colors = [bgTop.color.cgColor, bgBottom.color.cgColor] as CFArray
+        if let grad = CGGradient(colorsSpace: space, colors: colors, locations: [0, 1]) {
+            ctx.drawLinearGradient(grad,
+                                   start: CGPoint(x: 0, y: h),
+                                   end: CGPoint(x: 0, y: 0),
+                                   options: [])
+        } else {
+            ctx.setFillColor(bgTop.color.cgColor)
+            ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+        }
+
+        // Every cell at the floor color, one batched fill.
+        let side = cellSide, radius = cellSide * 0.28
+        let path = CGMutablePath()
+        for j in 0..<rows {
+            let cy = originY + CGFloat(j) * pitch
+            for i in 0..<cols {
+                let cx = originX + CGFloat(i) * pitch
+                let rect = CGRect(x: cx - side / 2, y: cy - side / 2,
+                                  width: side, height: side)
+                path.addPath(CGPath(roundedRect: rect, cornerWidth: radius,
+                                    cornerHeight: radius, transform: nil))
+            }
+        }
+        ctx.setFillColor(levelColors[floorLevelIndex].cgColor)
+        ctx.addPath(path)
+        ctx.fillPath()
+
+        floorImage = ctx.makeImage()
+    }
+
+    /// Halo sprites for each level that can bloom. The shadow blur then runs
+    /// once per level per rebuild instead of once per bloomed cell per frame.
+    private func rebuildBloomSprites(scale: CGFloat) {
+        bloomSprites = .init(repeating: nil, count: colorLevels)
+        guard !levelColors.isEmpty,
+              let space = CGColorSpace(name: CGColorSpace.sRGB) else { return }
+        let blur = cellSide * 1.2
+        let pad = ceil(blur * 2.5)            // halo alpha is negligible past this
+        let px = max(1, Int(((cellSide + pad * 2) * scale).rounded(.up)))
+        bloomSpriteSide = CGFloat(px) / scale
+        let bloomLevel = Int(CGFloat(colorLevels - 1) * 0.86)
+        for lvl in bloomLevel..<colorLevels {
+            bloomSprites[lvl] = makeSprite(side: bloomSpriteSide, scale: scale,
+                                           level: lvl, bloom: true, space: space)
+        }
     }
 
     public override func setFrameSize(_ newSize: NSSize) {
@@ -324,10 +458,38 @@ public final class UltracodeNetworkView: ScreenSaverView {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
         if trail.isEmpty { rebuildGrid() }
 
-        drawBackground(ctx)
+        // Match the cached images to this context's device scale (equals
+        // backingScaleFactor on screen; 1x in offscreen harness bitmaps).
+        let m = ctx.userSpaceToDeviceSpaceTransform
+        let ctxScale = max(abs(m.a), abs(m.b), abs(m.c), abs(m.d), 1)
+        let wantScale = window?.backingScaleFactor ?? ctxScale
+        if floorImage == nil || imageScale != wantScale {
+            rebuildImages(scale: wantScale)
+        }
+
+        // 1. Blit the pre-rendered empty lattice (bg gradient + floor cells).
+        if let floorImage {
+            ctx.draw(floorImage, in: bounds)
+        } else {
+            drawBackground(ctx)
+        }
 
         let bloomLevel = Int(CGFloat(colorLevels - 1) * 0.86)
         let f = CGFloat(config.floor)
+        let floorLvl = floorLevelIndex
+        let scale = imageScale > 0 ? imageScale : 1
+
+        // Snap sprite origins to the device pixel grid (<= half a device
+        // pixel, quarter point on Retina): CG then blits 1:1 instead of
+        // resampling every stamp, which is an order of magnitude faster.
+        func snap(_ v: CGFloat) -> CGFloat { (v * scale).rounded() / scale }
+
+        // 2. Stamp dynamic cells, one pre-rendered sprite per quantized
+        //    level. Floor-level cells are skipped (the blit already shows
+        //    them); bloomed cells are deferred and stamped on top.
+        let cellHalf = cellSpriteSide / 2
+        var blooms: [(x: CGFloat, y: CGFloat, lvl: Int)] = []
+
         for j in 0..<rows {
             let cy = originY + CGFloat(j) * pitch
             let rowBase = j * cols
@@ -335,9 +497,35 @@ public final class UltracodeNetworkView: ScreenSaverView {
                 let v = trail[rowBase + i]
                 let b = max(f, CGFloat(v))
                 let lvl = min(colorLevels - 1, max(0, Int(b * CGFloat(colorLevels - 1))))
+                if lvl <= floorLvl { continue }
                 let cx = originX + CGFloat(i) * pitch
-                drawCell(ctx, x: cx, y: cy, color: levelColors[lvl],
-                         bloom: config.bloom && lvl >= bloomLevel)
+                if config.bloom && lvl >= bloomLevel {
+                    blooms.append((cx, cy, lvl))
+                    continue
+                }
+                if lvl < cellSprites.count, let sprite = cellSprites[lvl] {
+                    ctx.draw(sprite, in: CGRect(x: snap(cx - cellHalf),
+                                                y: snap(cy - cellHalf),
+                                                width: cellSpriteSide,
+                                                height: cellSpriteSide))
+                } else {
+                    drawCell(ctx, x: cx, y: cy, color: levelColors[lvl], bloom: false)
+                }
+            }
+        }
+
+        // 3. Bloomed heads on top: stamp the halo sprite per cell
+        //    (composites identically to live drawCell, minus the per-cell
+        //    shadow blur). Falls back to drawCell if missing.
+        let bloomHalf = bloomSpriteSide / 2
+        for c in blooms {
+            if c.lvl < bloomSprites.count, let sprite = bloomSprites[c.lvl] {
+                ctx.draw(sprite, in: CGRect(x: snap(c.x - bloomHalf),
+                                            y: snap(c.y - bloomHalf),
+                                            width: bloomSpriteSide,
+                                            height: bloomSpriteSide))
+            } else {
+                drawCell(ctx, x: c.x, y: c.y, color: levelColors[c.lvl], bloom: true)
             }
         }
     }

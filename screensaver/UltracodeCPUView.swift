@@ -105,6 +105,29 @@ public final class UltracodeCPUView: ScreenSaverView {
     private var levelColors: [NSColor] = []
     private let colorLevels = 32
 
+    /// Pre-rendered empty lattice (background gradient + every cell at the
+    /// floor brightness), built once per rebuildGrid() at Retina scale and
+    /// blitted as the first drawing step of every frame.
+    private var floorImage: CGImage?
+    private var floorImageScale: CGFloat = 0
+
+    /// Pre-rendered cell sprite per quantized color level. Dynamic cells
+    /// are drawn as one pixel-aligned image blit each instead of a path
+    /// fill: CG path filling degrades badly when one path holds many
+    /// subpaths sharing scanlines (the per-level "bands" this saver
+    /// produces), while aligned blits of a cached raster are ~5x faster
+    /// than even individual fills. Cleared whenever the grid rebuilds.
+    private var cellSprites: [Int: CGImage] = [:]
+    private var cellSpriteMargin: CGFloat = 0
+    private var cellSpriteSide: CGFloat = 0
+
+    /// Pre-rendered glow sprite (shadow + cell body) per quantized color
+    /// level, so bloomed cells become one image blit each instead of a
+    /// per-cell CG shadow pass. Cleared whenever the grid rebuilds.
+    private var bloomSprites: [Int: CGImage] = [:]
+    private var bloomSpriteMargin: CGFloat = 0
+    private var bloomSpriteSide: CGFloat = 0
+
     // MARK: - CPU state
 
     // One bar per core; each fills bottom-to-top to that core's live load.
@@ -212,10 +235,139 @@ public final class UltracodeCPUView: ScreenSaverView {
             return ramp(b, stops: stops).color
         }
 
+        rebuildFloorImage()
+
         // Prime the CPU counters so the first visible sample is a real delta.
         _ = sampleCPU()
         refreshCPU()
         shownLoads = targetLoads
+    }
+
+    /// Render the entire empty lattice (gradient + floor cells) once into a
+    /// CGImage so draw(_:) can blit it instead of filling thousands of
+    /// floor cells per frame. Rebuilt by rebuildGrid() on resize/config
+    /// change, so the "Brilho do fundo" slider keeps working. Built at the
+    /// destination scale (the window's backing scale, or the actual context
+    /// scale detected in draw) so the blit is a 1:1 pixel copy.
+    private func rebuildFloorImage(scale targetScale: CGFloat? = nil) {
+        floorImage = nil
+        cellSprites.removeAll()
+        bloomSprites.removeAll()
+        let scale = targetScale ?? (window?.backingScaleFactor ?? 2)
+        floorImageScale = scale
+        let pw = Int(bounds.width * scale)
+        let ph = Int(bounds.height * scale)
+        guard pw > 0, ph > 0, !levelColors.isEmpty,
+              let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let ctx = CGContext(data: nil, width: pw, height: ph,
+                                  bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: space,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return }
+        ctx.scaleBy(x: scale, y: scale)
+
+        // Same gradient as drawBackground().
+        let colors = [bgTop.color.cgColor, bgBottom.color.cgColor] as CFArray
+        if let grad = CGGradient(colorsSpace: space, colors: colors, locations: [0, 1]) {
+            ctx.drawLinearGradient(grad,
+                                   start: CGPoint(x: 0, y: bounds.height),
+                                   end: CGPoint(x: 0, y: 0),
+                                   options: [])
+        } else {
+            ctx.setFillColor(bgTop.color.cgColor)
+            ctx.fill(CGRect(x: 0, y: 0, width: bounds.width, height: bounds.height))
+        }
+
+        // Every cell at the floor color, quantized exactly like the old
+        // per-cell path did (b = floor -> level index into levelColors).
+        let f = CGFloat(config.floor)
+        let floorLvl = min(colorLevels - 1, max(0, Int(f * CGFloat(colorLevels - 1))))
+        let radius = cellSide * 0.28
+        let path = CGMutablePath()
+        for i in 0..<cols {
+            let cx = originX + CGFloat(i) * pitch
+            for j in 0..<rows {
+                let cy = originY + CGFloat(j) * pitch
+                path.addRoundedRect(in: CGRect(x: cx - cellSide / 2,
+                                               y: cy - cellSide / 2,
+                                               width: cellSide,
+                                               height: cellSide),
+                                    cornerWidth: radius, cornerHeight: radius)
+            }
+        }
+        ctx.setFillColor(levelColors[floorLvl].cgColor)
+        ctx.addPath(path)
+        ctx.fillPath()
+        floorImage = ctx.makeImage()
+    }
+
+    /// Plain rounded-rect cell body for the given level, rendered once into
+    /// a transparent image and blitted (pixel-aligned) per dynamic cell.
+    private func cellSprite(level: Int) -> CGImage? {
+        if let s = cellSprites[level] { return s }
+        let scale = floorImageScale > 0 ? floorImageScale : 2
+        let margin: CGFloat = 1 // room for the antialiased edge
+        let side = cellSide + margin * 2
+        let px = Int(ceil(side * scale))
+        guard px > 0, level >= 0, level < levelColors.count,
+              let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let c = CGContext(data: nil, width: px, height: px,
+                                bitsPerComponent: 8, bytesPerRow: 0,
+                                space: space,
+                                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return nil }
+        c.scaleBy(x: scale, y: scale)
+        c.setFillColor(levelColors[level].cgColor)
+        let path = CGMutablePath()
+        path.addRoundedRect(in: CGRect(x: margin, y: margin,
+                                       width: cellSide, height: cellSide),
+                            cornerWidth: cellSide * 0.28,
+                            cornerHeight: cellSide * 0.28)
+        c.addPath(path)
+        c.fillPath()
+        guard let img = c.makeImage() else { return nil }
+        cellSpriteMargin = margin
+        cellSpriteSide = CGFloat(px) / scale
+        cellSprites[level] = img
+        return img
+    }
+
+    /// Shadow + cell body for a bloomed cell of the given level, rendered
+    /// once into a transparent image. Per-cell blits of this sprite
+    /// composite exactly like the per-cell shadow fills they replace
+    /// (source-over is associative), but cost a fraction of a CG shadow
+    /// pass each. Built lazily, cached until the next grid rebuild.
+    private func bloomSprite(level: Int) -> CGImage? {
+        if let s = bloomSprites[level] { return s }
+        let scale = floorImageScale > 0 ? floorImageScale : 2
+        let blur = cellSide * 1.2
+        let margin = ceil(blur * 1.6)
+        let side = cellSide + margin * 2
+        let px = Int(ceil(side * scale))
+        guard px > 0, level >= 0, level < levelColors.count,
+              let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let c = CGContext(data: nil, width: px, height: px,
+                                bitsPerComponent: 8, bytesPerRow: 0,
+                                space: space,
+                                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return nil }
+        c.scaleBy(x: scale, y: scale)
+        let color = levelColors[level]
+        c.setShadow(offset: .zero, blur: blur,
+                    color: color.withAlphaComponent(0.8).cgColor)
+        c.setFillColor(color.cgColor)
+        let path = CGMutablePath()
+        path.addRoundedRect(in: CGRect(x: margin, y: margin,
+                                       width: cellSide, height: cellSide),
+                            cornerWidth: cellSide * 0.28,
+                            cornerHeight: cellSide * 0.28)
+        c.addPath(path)
+        c.fillPath()
+        guard let img = c.makeImage() else { return nil }
+        bloomSpriteMargin = margin
+        bloomSpriteSide = CGFloat(px) / scale
+        bloomSprites[level] = img
+        return img
     }
 
     public override func setFrameSize(_ newSize: NSSize) {
@@ -260,11 +412,30 @@ public final class UltracodeCPUView: ScreenSaverView {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
         if levelColors.isEmpty { rebuildGrid() }
 
-        drawBackground(ctx)
+        // Match the cached images to the actual destination scale so the
+        // blits are 1:1 pixel copies (no per-frame resampling).
+        let devScale = abs(ctx.convertToDeviceSpace(CGSize(width: 0, height: 1)).height)
+        let scale = devScale > 0.01 ? devScale : 2
+        if floorImage == nil || abs(floorImageScale - scale) > 0.001 {
+            rebuildFloorImage(scale: scale)
+        }
+
+        // Blit the pre-rendered empty lattice (gradient + floor cells) in
+        // one call instead of filling thousands of floor cells.
+        if let floorImage {
+            ctx.draw(floorImage, in: bounds)
+        } else {
+            drawBackground(ctx)
+        }
 
         let nCores = max(1, shownLoads.count)
         let bloomLevel = Int(CGFloat(colorLevels - 1) * 0.80)
-        let f = CGFloat(config.floor)
+
+        // Dynamic (non-floor) cells are grouped by their quantized color
+        // level and drawn as pixel-aligned blits of one cached sprite per
+        // level. Bloomed cells are collected and drawn ON TOP at the end
+        // (their glow must layer above the cell bodies).
+        var bloomCells: [(x: CGFloat, y: CGFloat, lvl: Int)] = []
 
         for i in 0..<cols {
             let cx = originX + CGFloat(i) * pitch
@@ -276,10 +447,9 @@ public final class UltracodeCPUView: ScreenSaverView {
             // Per-column ripple on the waterline; a busy core ripples harder.
             let amp = 0.25 + 0.45 * load
             let wob = amp * sin(Float(i) * 0.7 + phase * 2.0 + Float(core) * 1.3)
+            let surface = level + (load > 0.001 && load < 0.999 ? wob : 0)
 
             for j in 0..<rows {
-                let cy = originY + CGFloat(j) * pitch
-                let surface = level + (load > 0.001 && load < 0.999 ? wob : 0)
                 let jf = Float(j)
 
                 var b: CGFloat
@@ -291,11 +461,38 @@ public final class UltracodeCPUView: ScreenSaverView {
                     b = 1.0
                     isSurface = true
                 } else {
-                    b = f
+                    // Floor: the blit already shows it, and every cell above
+                    // this one in the column is floor too.
+                    break
                 }
+                let cy = originY + CGFloat(j) * pitch
                 let lvl = min(colorLevels - 1, max(0, Int(b * CGFloat(colorLevels - 1))))
-                drawCell(ctx, x: cx, y: cy, color: levelColors[lvl],
-                         bloom: config.bloom && (isSurface || lvl >= bloomLevel))
+                if config.bloom && (isSurface || lvl >= bloomLevel) {
+                    bloomCells.append((x: cx, y: cy, lvl: lvl))
+                } else if let sprite = cellSprite(level: lvl) {
+                    // Align the blit to the device pixel grid so CG takes
+                    // its fast (non-interpolating) path. The shift is at
+                    // most half a device pixel, uniform across the grid.
+                    let dx = ((cx - cellSide / 2 - cellSpriteMargin) * scale).rounded() / scale
+                    let dy = ((cy - cellSide / 2 - cellSpriteMargin) * scale).rounded() / scale
+                    ctx.draw(sprite, in: CGRect(x: dx, y: dy,
+                                                width: cellSpriteSide,
+                                                height: cellSpriteSide))
+                } else {
+                    drawCell(ctx, x: cx, y: cy, color: levelColors[lvl], bloom: false)
+                }
+            }
+        }
+
+        for c in bloomCells {
+            if let sprite = bloomSprite(level: c.lvl) {
+                let dx = ((c.x - cellSide / 2 - bloomSpriteMargin) * scale).rounded() / scale
+                let dy = ((c.y - cellSide / 2 - bloomSpriteMargin) * scale).rounded() / scale
+                ctx.draw(sprite, in: CGRect(x: dx, y: dy,
+                                            width: bloomSpriteSide,
+                                            height: bloomSpriteSide))
+            } else {
+                drawCell(ctx, x: c.x, y: c.y, color: levelColors[c.lvl], bloom: true)
             }
         }
     }

@@ -103,7 +103,17 @@ public final class UltracodeSandView: ScreenSaverView {
     private var originY: CGFloat = 0
 
     private var levelColors: [NSColor] = []
+    private var levelCGColors: [CGColor] = []
     private let colorLevels = 32
+
+    /// Quantized level the empty "floor" cells land on; cells at this level
+    /// are covered by the pre-rendered floor blit and never drawn per-cell.
+    private var floorLevelIndex = 0
+
+    /// Entire empty lattice (bg gradient + one rounded rect per cell at the
+    /// floor color) pre-rendered at Retina scale. Blitted once per frame so
+    /// only non-floor cells need real path fills.
+    private var floorImage: CGImage?
 
     // MARK: - Sand state
 
@@ -178,6 +188,10 @@ public final class UltracodeSandView: ScreenSaverView {
             let b = f + (1 - f) * CGFloat(l) / CGFloat(colorLevels - 1)
             return ramp(b, stops: stops).color
         }
+        levelCGColors = levelColors.map(\.cgColor)
+        floorLevelIndex = min(colorLevels - 1,
+                              max(0, Int(f * CGFloat(colorLevels - 1))))
+        rebuildFloorImage()
 
         cells = .init(repeating: 0, count: cols * rows)
         falling = .init(repeating: false, count: cols * rows)
@@ -348,29 +362,63 @@ public final class UltracodeSandView: ScreenSaverView {
 
     public override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
-        if cells.isEmpty || levelColors.isEmpty { rebuildGrid() }
+        if cells.isEmpty || levelColors.isEmpty || floorImage == nil { rebuildGrid() }
+        guard let floor = floorImage else { return }
 
-        drawBackground(ctx)
+        // One blit covers the bg gradient and every cell at the floor level.
+        ctx.draw(floor, in: bounds)
 
+        // Dynamic cells: batch all rounded rects of the same quantized color
+        // into one path so each level costs a single fill. Bloomed cells are
+        // collected and drawn individually ON TOP (they need the shadow).
         let bloomRow = rows - 3
+        let radius = cellSide * 0.28
+        var batches = [CGMutablePath?](repeating: nil, count: colorLevels)
+        var bloomCells: [(x: CGFloat, y: CGFloat, level: Int)] = []
+
         for j in 0..<rows {
             let cy = originY + CGFloat(j) * pitch
+            let rowBase = j * cols
             for i in 0..<cols {
-                let cx = originX + CGFloat(i) * pitch
-                let cell = idx(i, j)
+                let cell = rowBase + i
                 let lvl = cells[cell]
-                var b: CGFloat = CGFloat(config.floor)
+                if lvl <= 0 { continue }
+                var b = CGFloat(lvl)
                 var bloom = false
-                if lvl > 0 {
-                    b = CGFloat(lvl)
-                    if falling[cell] {
-                        b = min(1.0, b + 0.10)
-                        bloom = config.bloom && j >= bloomRow
-                    }
+                if falling[cell] {
+                    b = min(1.0, b + 0.10)
+                    bloom = config.bloom && j >= bloomRow
                 }
                 let l = min(colorLevels - 1, max(0, Int(b * CGFloat(colorLevels - 1))))
-                drawCell(ctx, x: cx, y: cy, color: levelColors[l], bloom: bloom)
+                let cx = originX + CGFloat(i) * pitch
+                if bloom {
+                    bloomCells.append((cx, cy, l))
+                    continue
+                }
+                if l == floorLevelIndex { continue }  // already in the blit
+                let rect = CGRect(x: cx - cellSide / 2, y: cy - cellSide / 2,
+                                  width: cellSide, height: cellSide)
+                let path: CGMutablePath
+                if let existing = batches[l] {
+                    path = existing
+                } else {
+                    path = CGMutablePath()
+                    batches[l] = path
+                }
+                path.addPath(CGPath(roundedRect: rect, cornerWidth: radius,
+                                    cornerHeight: radius, transform: nil))
             }
+        }
+
+        for l in 0..<colorLevels {
+            guard let path = batches[l] else { continue }
+            ctx.setFillColor(levelCGColors[l])
+            ctx.addPath(path)
+            ctx.fillPath()
+        }
+
+        for c in bloomCells {
+            drawCell(ctx, x: c.x, y: c.y, color: levelColors[c.level], bloom: true)
         }
     }
 
@@ -386,6 +434,45 @@ public final class UltracodeSandView: ScreenSaverView {
             bgTop.color.setFill()
             bounds.fill()
         }
+    }
+
+    /// Render the whole empty lattice (gradient + floor cells) once into a
+    /// Retina-scale CGImage. Rebuilt by rebuildGrid() on resize/config change
+    /// so the "Brilho do fundo" slider keeps working.
+    private func rebuildFloorImage() {
+        floorImage = nil
+        guard bounds.width >= 1, bounds.height >= 1,
+              levelColors.indices.contains(floorLevelIndex) else { return }
+        let scale = window?.backingScaleFactor ?? 2
+        let pw = max(1, Int((bounds.width * scale).rounded()))
+        let ph = max(1, Int((bounds.height * scale).rounded()))
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let ctx = CGContext(data: nil, width: pw, height: ph,
+                                  bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: space,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return }
+        ctx.scaleBy(x: scale, y: scale)
+
+        drawBackground(ctx)
+
+        let radius = cellSide * 0.28
+        let path = CGMutablePath()
+        for j in 0..<rows {
+            let cy = originY + CGFloat(j) * pitch
+            for i in 0..<cols {
+                let cx = originX + CGFloat(i) * pitch
+                let rect = CGRect(x: cx - cellSide / 2, y: cy - cellSide / 2,
+                                  width: cellSide, height: cellSide)
+                path.addPath(CGPath(roundedRect: rect, cornerWidth: radius,
+                                    cornerHeight: radius, transform: nil))
+            }
+        }
+        ctx.setFillColor(levelCGColors[floorLevelIndex])
+        ctx.addPath(path)
+        ctx.fillPath()
+
+        floorImage = ctx.makeImage()
     }
 
     private func drawCell(_ ctx: CGContext, x: CGFloat, y: CGFloat,

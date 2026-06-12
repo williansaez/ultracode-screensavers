@@ -127,6 +127,18 @@ public final class UltracodeClockView: ScreenSaverView {
     private var levelColors: [NSColor] = []
     private let colorLevels = 32
 
+    /// Pre-rendered empty lattice (bg gradient + every cell at floor color),
+    /// blitted as the first draw step so floor cells cost one image draw
+    /// instead of thousands of path fills. Rebuilt by rebuildGrid().
+    private var floorImage: CGImage?
+
+    /// Quantized color level of an empty (floor) cell; cells at this level
+    /// are skipped during drawing because the floor blit already shows them.
+    private var floorLevel: Int {
+        let f = CGFloat(config.floor)
+        return min(colorLevels - 1, max(0, Int(f * CGFloat(colorLevels - 1))))
+    }
+
     // MARK: - Clock state
 
     // The lit-cell sets of the four HH:MM digits, plus a separately handled
@@ -260,6 +272,45 @@ public final class UltracodeClockView: ScreenSaverView {
         litDigit = computeLit(hour: h, minute: m)
         pendingLit = litDigit
         brightness = litDigit.map { $0 ? 1 : 0 }
+
+        rebuildFloorImage()
+    }
+
+    /// Renders the empty lattice (bg gradient + all cells at floor color)
+    /// once into a Retina-scale CGImage for per-frame blitting.
+    private func rebuildFloorImage() {
+        floorImage = nil
+        let imgScale = window?.backingScaleFactor ?? 2
+        let pxW = Int((bounds.width * imgScale).rounded())
+        let pxH = Int((bounds.height * imgScale).rounded())
+        guard pxW > 0, pxH > 0,
+              let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let ctx = CGContext(data: nil, width: pxW, height: pxH,
+                                  bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: space,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return }
+        ctx.scaleBy(x: imgScale, y: imgScale)
+
+        drawBackground(ctx)
+
+        guard !levelColors.isEmpty else { return }
+        ctx.setFillColor(levelColors[floorLevel].cgColor)
+        let radius = cellSide * 0.28
+        let path = CGMutablePath()
+        for j in 0..<rows {
+            let cy = originY + CGFloat(j) * pitch
+            for i in 0..<cols {
+                let rect = CGRect(x: originX + CGFloat(i) * pitch - cellSide / 2,
+                                  y: cy - cellSide / 2,
+                                  width: cellSide, height: cellSide)
+                path.addPath(CGPath(roundedRect: rect, cornerWidth: radius,
+                                    cornerHeight: radius, transform: nil))
+            }
+        }
+        ctx.addPath(path)
+        ctx.fillPath()
+        floorImage = ctx.makeImage()
     }
 
     /// Grid-cell indices covered by one digit slot's 5x7 block.
@@ -381,15 +432,29 @@ public final class UltracodeClockView: ScreenSaverView {
 
     public override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
-        if levelColors.isEmpty || brightness.count != cols * rows { rebuildGrid() }
+        if levelColors.isEmpty || brightness.count != cols * rows
+            || floorImage == nil { rebuildGrid() }
 
-        drawBackground(ctx)
+        // 1. Blit the pre-rendered empty lattice (gradient + floor cells).
+        if let floorImage {
+            ctx.draw(floorImage, in: bounds)
+        } else {
+            drawBackground(ctx)
+        }
 
         var colonSet = [Bool](repeating: false, count: cols * rows)
         for c in colonCells { colonSet[c] = true }
 
         let t = Float(simTime)
         let f = CGFloat(config.floor)
+        let floorLvl = floorLevel
+        let radius = cellSide * 0.28
+
+        // 2. Batch the dynamic (brighter-than-floor) cells: one path per
+        //    quantized level, one fill per level present this frame.
+        var levelPaths = [CGMutablePath?](repeating: nil, count: colorLevels)
+        var bloomCells: [(x: CGFloat, y: CGFloat, lvl: Int)] = []
+
         for j in 0..<rows {
             let cy = originY + CGFloat(j) * pitch
             let rowBase = j * cols
@@ -404,11 +469,33 @@ public final class UltracodeClockView: ScreenSaverView {
                 // ramp; 0.75/0.90 keeps the lit top identical at floor 0.10.
                 let b = f + (1 - f) * (0.75 / 0.90) * CGFloat(min(max(v, 0), 1))
                 let lvl = min(colorLevels - 1, max(0, Int(b * CGFloat(colorLevels - 1))))
-                let isColonGlow = colonSet[idx] && v > 0.5
-                drawCell(ctx, x: originX + CGFloat(i) * pitch, y: cy,
-                         color: levelColors[lvl],
-                         bloom: config.bloom && isColonGlow)
+                if config.bloom && colonSet[idx] && v > 0.5 {
+                    bloomCells.append((originX + CGFloat(i) * pitch, cy, lvl))
+                    continue
+                }
+                if lvl == floorLvl { continue }  // floor blit already shows it
+                let rect = CGRect(x: originX + CGFloat(i) * pitch - cellSide / 2,
+                                  y: cy - cellSide / 2,
+                                  width: cellSide, height: cellSide)
+                let path = levelPaths[lvl] ?? CGMutablePath()
+                path.addPath(CGPath(roundedRect: rect, cornerWidth: radius,
+                                    cornerHeight: radius, transform: nil))
+                levelPaths[lvl] = path
             }
+        }
+
+        for lvl in 0..<colorLevels {
+            guard let path = levelPaths[lvl] else { continue }
+            ctx.setFillColor(levelColors[lvl].cgColor)
+            ctx.addPath(path)
+            ctx.fillPath()
+        }
+
+        // 3. Bloomed colon dots: few cells, drawn individually on top so the
+        //    shadow renders correctly.
+        for cell in bloomCells {
+            drawCell(ctx, x: cell.x, y: cell.y,
+                     color: levelColors[cell.lvl], bloom: true)
         }
     }
 
@@ -421,8 +508,8 @@ public final class UltracodeClockView: ScreenSaverView {
                                    end: CGPoint(x: 0, y: 0),
                                    options: [])
         } else {
-            bgTop.color.setFill()
-            bounds.fill()
+            ctx.setFillColor(bgTop.color.cgColor)
+            ctx.fill(bounds)
         }
     }
 

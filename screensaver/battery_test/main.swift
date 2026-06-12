@@ -30,6 +30,37 @@ func snapshot(_ view: NSView, to path: String) {
     print("wrote \(path)")
 }
 
+// Perf gate: BATT_PERF=1 measures average sim+draw ms/frame instead of
+// writing snapshots. Pitch comes from the module prefs — set it first with
+// `defaults -currentHost write com.williansaez.ultracode-battery pitch -float 8`.
+if ProcessInfo.processInfo.environment["BATT_PERF"] != nil {
+    guard let v = UltracodeBatteryView(frame: NSRect(origin: .zero, size: size),
+                                       isPreview: false) else {
+        fatalError("failed to create view")
+    }
+    let pct = Float(ProcessInfo.processInfo.environment["BATT_PERF_PCT"] ?? "") ?? 0.85
+    v.debugSetBattery(pct, charging: false)
+    let b = v.bounds
+    guard let rep = NSBitmapImageRep(
+        bitmapDataPlanes: nil,
+        pixelsWide: Int(b.width), pixelsHigh: Int(b.height),
+        bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+        colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+    ), let gctx = NSGraphicsContext(bitmapImageRep: rep) else {
+        fatalError("failed to create bitmap context")
+    }
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = gctx
+    for _ in 0..<5 { v.animateOneFrame(); v.draw(b) }   // warm-up
+    let t0 = CFAbsoluteTimeGetCurrent()
+    for _ in 0..<60 { v.animateOneFrame(); v.draw(b) }
+    let dt = CFAbsoluteTimeGetCurrent() - t0
+    NSGraphicsContext.restoreGraphicsState()
+    print(String(format: "perf: %.3f ms/frame (60 frames, %.0fx%.0f)",
+                 dt / 60 * 1000, b.width, b.height))
+    exit(0)
+}
+
 guard let view = UltracodeBatteryView(frame: NSRect(origin: .zero, size: size),
                                       isPreview: false) else {
     fatalError("failed to create view")

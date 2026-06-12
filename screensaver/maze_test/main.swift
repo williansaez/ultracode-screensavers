@@ -30,6 +30,46 @@ func snapshot(_ view: NSView, to path: String) {
     print("wrote \(path)")
 }
 
+// Timing-only mode (ULTRACODE_TIMING=1): build a fresh view at whatever
+// prefs are set (write pitch via `defaults -currentHost write` first), pump
+// animateOneFrame + an offscreen draw(bounds) 60x and print average ms/frame.
+if ProcessInfo.processInfo.environment["ULTRACODE_TIMING"] != nil {
+    guard let tv = UltracodeMazeView(frame: NSRect(origin: .zero, size: size),
+                                     isPreview: false) else {
+        fatalError("failed to create timing view")
+    }
+    guard let rep = NSBitmapImageRep(
+        bitmapDataPlanes: nil,
+        pixelsWide: Int(size.width), pixelsHigh: Int(size.height),
+        bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+        colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+    ), let gctx = NSGraphicsContext(bitmapImageRep: rep) else {
+        fatalError("failed to create timing bitmap context")
+    }
+    func frame() {
+        tv.animateOneFrame()
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = gctx
+        tv.draw(tv.bounds)
+        NSGraphicsContext.restoreGraphicsState()
+    }
+    func time60(_ label: String) {
+        let t0 = CFAbsoluteTimeGetCurrent()
+        for _ in 0..<60 { frame() }
+        let ms = (CFAbsoluteTimeGetCurrent() - t0) / 60 * 1000
+        print(String(format: "timing[%@]: %.2f ms/frame (sim+draw, 60 frames)",
+                     label, ms))
+    }
+    frame()   // warm-up: triggers rebuildGrid + floor image build
+    time60("generating")
+    var guardFrames = 0
+    while tv.debugPhaseName != "holding" && guardFrames < 8000 {
+        tv.animateOneFrame(); guardFrames += 1
+    }
+    time60("holding-worstcase")
+    exit(0)
+}
+
 guard let view = UltracodeMazeView(frame: NSRect(origin: .zero, size: size),
                                    isPreview: false) else {
     fatalError("failed to create view")

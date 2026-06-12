@@ -103,7 +103,13 @@ public final class UltracodePhysarumView: ScreenSaverView {
     private var originY: CGFloat = 0
 
     private var levelColors: [NSColor] = []
+    private var levelCGColors: [CGColor] = []
     private let colorLevels = 32
+    private var floorLevelIndex = 0
+
+    /// Empty lattice (bg gradient + every cell at floor brightness),
+    /// pre-rendered once per rebuildGrid() and blitted each frame.
+    private var floorImage: CGImage?
 
     // MARK: - Space-colonization growth from one inoculation point
 
@@ -225,8 +231,62 @@ public final class UltracodePhysarumView: ScreenSaverView {
             let b = f + (1 - f) * CGFloat(l) / CGFloat(colorLevels - 1)
             return ramp(b, stops: stops).color
         }
+        levelCGColors = levelColors.map(\.cgColor)
+        // Quantized level of an empty cell: b = max(floor, 0) = floor.
+        floorLevelIndex = min(colorLevels - 1,
+                              Int(CGFloat(config.floor) * CGFloat(colorLevels - 1)))
 
+        rebuildFloorImage()
         reseed()
+    }
+
+    /// Renders the empty lattice (gradient + all cells at floor brightness)
+    /// once into a CGImage at Retina scale; draw() blits it instead of
+    /// filling thousands of floor cells per frame.
+    private func rebuildFloorImage() {
+        floorImage = nil
+        let w = bounds.width, h = bounds.height
+        guard w >= 1, h >= 1 else { return }
+        let scale = window?.backingScaleFactor ?? 2
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let ctx = CGContext(data: nil,
+                                  width: Int(w * scale), height: Int(h * scale),
+                                  bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: space,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return }
+        ctx.scaleBy(x: scale, y: scale)
+
+        // Background gradient, same as drawBackground().
+        let colors = [bgTop.color.cgColor, bgBottom.color.cgColor] as CFArray
+        if let grad = CGGradient(colorsSpace: space, colors: colors, locations: [0, 1]) {
+            ctx.drawLinearGradient(grad,
+                                   start: CGPoint(x: 0, y: h),
+                                   end: CGPoint(x: 0, y: 0),
+                                   options: [])
+        } else {
+            ctx.setFillColor(bgTop.color.cgColor)
+            ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+        }
+
+        // Every cell at the floor color, one batched fill.
+        let path = CGMutablePath()
+        let radius = cellSide * 0.28
+        for j in 0..<rows {
+            let cy = originY + CGFloat(j) * pitch
+            for i in 0..<cols {
+                let cx = originX + CGFloat(i) * pitch
+                path.addPath(CGPath(
+                    roundedRect: CGRect(x: cx - cellSide / 2, y: cy - cellSide / 2,
+                                        width: cellSide, height: cellSide),
+                    cornerWidth: radius, cornerHeight: radius, transform: nil))
+            }
+        }
+        ctx.setFillColor(levelCGColors[floorLevelIndex])
+        ctx.addPath(path)
+        ctx.fillPath()
+
+        floorImage = ctx.makeImage()
     }
 
     private func reseed() {
@@ -428,11 +488,23 @@ public final class UltracodePhysarumView: ScreenSaverView {
 
     public override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
-        if trail.isEmpty { rebuildGrid() }
+        if trail.isEmpty || floorImage == nil { rebuildGrid() }
 
-        drawBackground(ctx)
+        // 1. Blit the pre-rendered empty lattice (gradient + floor cells).
+        if let floorImage {
+            ctx.draw(floorImage, in: bounds)
+        } else {
+            drawBackground(ctx)
+        }
 
+        // 2. Dynamic cells, batched by quantized color level: one fill per
+        //    level instead of one NSBezierPath fill per cell. Cells at the
+        //    floor level are skipped — the blit already shows them.
         let bloomLevel = Int(CGFloat(colorLevels - 1) * 0.80)
+        var levelPaths = [CGMutablePath?](repeating: nil, count: colorLevels)
+        var bloomCells: [(x: CGFloat, y: CGFloat, level: Int)] = []
+        let radius = cellSide * 0.28
+
         for j in 0..<rows {
             let cy = originY + CGFloat(j) * pitch
             for i in 0..<cols {
@@ -446,11 +518,32 @@ public final class UltracodePhysarumView: ScreenSaverView {
                 }
                 let b = max(CGFloat(config.floor), CGFloat(v))
                 let level = min(colorLevels - 1, Int(b * CGFloat(colorLevels - 1)))
+                if level <= floorLevelIndex { continue }
                 let cx = originX + CGFloat(i) * pitch
-                drawCell(ctx, x: cx, y: cy,
-                         color: levelColors[level],
-                         bloom: config.bloom && level >= bloomLevel)
+                if config.bloom && level >= bloomLevel {
+                    bloomCells.append((cx, cy, level))
+                    continue
+                }
+                let path = levelPaths[level] ?? CGMutablePath()
+                path.addPath(CGPath(
+                    roundedRect: CGRect(x: cx - cellSide / 2, y: cy - cellSide / 2,
+                                        width: cellSide, height: cellSide),
+                    cornerWidth: radius, cornerHeight: radius, transform: nil))
+                levelPaths[level] = path
             }
+        }
+
+        for level in 0..<colorLevels {
+            guard let path = levelPaths[level] else { continue }
+            ctx.setFillColor(levelCGColors[level])
+            ctx.addPath(path)
+            ctx.fillPath()
+        }
+
+        // 3. Bloomed cells on top, individually (few, and they need the shadow).
+        for cell in bloomCells {
+            drawCell(ctx, x: cell.x, y: cell.y,
+                     color: levelColors[cell.level], bloom: true)
         }
     }
 

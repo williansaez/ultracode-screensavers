@@ -115,6 +115,11 @@ public final class UltracodePongView: ScreenSaverView {
     private var levelColors: [NSColor] = []
     private let colorLevels = 32
 
+    /// Pre-rendered background gradient + every cell at floor brightness.
+    /// Blitted once per frame so draw() only fills the dynamic cells.
+    private var floorImage: CGImage?
+    private var floorLevelIndex = 0
+
     // MARK: - Pong state
 
     // Self-playing Pong. The ball lives in continuous cell coordinates and
@@ -203,6 +208,9 @@ public final class UltracodePongView: ScreenSaverView {
             let b = f + (1 - f) * CGFloat(l) / CGFloat(colorLevels - 1)
             return ramp(b, stops: stops).color
         }
+        floorLevelIndex = min(colorLevels - 1,
+                              max(0, Int(f * CGFloat(colorLevels - 1))))
+        rebuildFloorImage()
 
         trail = [Float](repeating: 0, count: cols * rows)
         padY = [Float(rows - 1) / 2, Float(rows - 1) / 2]
@@ -213,6 +221,43 @@ public final class UltracodePongView: ScreenSaverView {
         flashFrames = 0
         serveDir = randFloat() < 0.5 ? -1 : 1
         serve()
+    }
+
+    /// Renders the empty lattice (gradient + floor-color cells) once into a
+    /// Retina-scale CGImage. draw(_:) blits it instead of filling thousands
+    /// of floor cells per frame. Runs on every rebuildGrid(), so resize,
+    /// theme and "Brilho do fundo" changes regenerate it.
+    private func rebuildFloorImage() {
+        floorImage = nil
+        let scale = window?.backingScaleFactor ?? 2
+        let pw = max(1, Int(bounds.width * scale))
+        let ph = max(1, Int(bounds.height * scale))
+        guard !levelColors.isEmpty,
+              let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let ctx = CGContext(data: nil, width: pw, height: ph,
+                                  bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: space,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return }
+        ctx.scaleBy(x: scale, y: scale)
+        drawBackground(ctx)
+
+        ctx.setFillColor(levelColors[floorLevelIndex].cgColor)
+        let radius = cellSide * 0.28
+        let path = CGMutablePath()
+        for i in 0..<cols {
+            let cx = originX + CGFloat(i) * pitch
+            for j in 0..<rows {
+                let cy = originY + CGFloat(j) * pitch
+                let rect = CGRect(x: cx - cellSide / 2, y: cy - cellSide / 2,
+                                  width: cellSide, height: cellSide)
+                path.addPath(CGPath(roundedRect: rect, cornerWidth: radius,
+                                    cornerHeight: radius, transform: nil))
+            }
+        }
+        ctx.addPath(path)
+        ctx.fillPath()
+        floorImage = ctx.makeImage()
     }
 
     public override func setFrameSize(_ newSize: NSSize) {
@@ -360,19 +405,35 @@ public final class UltracodePongView: ScreenSaverView {
     public override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
         if levelColors.isEmpty || trail.count != cols * rows { rebuildGrid() }
+        if floorImage == nil { rebuildFloorImage() }
 
-        drawBackground(ctx)
+        // Floor blit: gradient + every floor-brightness cell in one call.
+        let haveFloor = floorImage != nil
+        if let floorImage {
+            ctx.draw(floorImage, in: bounds)
+        } else {
+            drawBackground(ctx)
+        }
 
         let midCol = cols / 2
         let ballVisible = pauseFrames == 0
         let bi = min(max(Int(ballX.rounded()), 0), cols - 1)
         let bj = min(max(Int(ballY.rounded()), 0), rows - 1)
         let f = CGFloat(config.floor)
+        let radius = cellSide * 0.28
+
+        // Batch the dynamic cells into ONE path per quantized color level;
+        // the ball is held back and drawn individually on top (bloom shadow).
+        var levelPaths = [CGMutablePath?](repeating: nil, count: colorLevels)
+        var ballPos: (x: CGFloat, y: CGFloat)? = nil
 
         for i in 0..<cols {
             let cx = originX + CGFloat(i) * pitch
             for j in 0..<rows {
-                let cy = originY + CGFloat(j) * pitch
+                if ballVisible && i == bi && j == bj {
+                    ballPos = (cx, originY + CGFloat(j) * pitch)
+                    continue
+                }
 
                 var b: CGFloat = f
                 // Faint dotted center line, slightly above the floor.
@@ -392,27 +453,41 @@ public final class UltracodePongView: ScreenSaverView {
                    (i == cols - 2 && abs(Float(j) - padY[1]) < padHalf) {
                     b = max(b, 0.80)
                 }
-                // Ball: full white-hot with bloom.
-                var isBall = false
-                if ballVisible && i == bi && j == bj {
-                    b = 1.0
-                    isBall = true
-                }
 
                 let lvl = min(colorLevels - 1, max(0, Int(b * CGFloat(colorLevels - 1))))
-                let cellColor: NSColor
-                if isBall {
-                    // Ball pops in the suite-wide accent, scaled by its
-                    // brightness factor; trail/paddles stay on the ramp.
-                    let a = contrastAccent(forTheme: config.theme)
-                    cellColor = NSColor(srgbRed: a.r * b, green: a.g * b,
-                                        blue: a.b * b, alpha: 1)
+                // Floor-level cells are already in the blit.
+                if haveFloor && lvl == floorLevelIndex { continue }
+
+                let cy = originY + CGFloat(j) * pitch
+                let rect = CGRect(x: cx - cellSide / 2, y: cy - cellSide / 2,
+                                  width: cellSide, height: cellSide)
+                let cellPath = CGPath(roundedRect: rect, cornerWidth: radius,
+                                      cornerHeight: radius, transform: nil)
+                if let p = levelPaths[lvl] {
+                    p.addPath(cellPath)
                 } else {
-                    cellColor = levelColors[lvl]
+                    let p = CGMutablePath()
+                    p.addPath(cellPath)
+                    levelPaths[lvl] = p
                 }
-                drawCell(ctx, x: cx, y: cy, color: cellColor,
-                         bloom: config.bloom && isBall)
             }
+        }
+
+        // One fill per color level present this frame.
+        for lvl in 0..<colorLevels {
+            guard let p = levelPaths[lvl] else { continue }
+            ctx.setFillColor(levelColors[lvl].cgColor)
+            ctx.addPath(p)
+            ctx.fillPath()
+        }
+
+        // Ball: full white-hot in the suite-wide accent, with bloom, on top;
+        // trail/paddles stay on the ramp.
+        if let pos = ballPos {
+            let a = contrastAccent(forTheme: config.theme)
+            let cellColor = NSColor(srgbRed: a.r, green: a.g, blue: a.b, alpha: 1)
+            drawCell(ctx, x: pos.x, y: pos.y, color: cellColor,
+                     bloom: config.bloom)
         }
     }
 
@@ -425,8 +500,8 @@ public final class UltracodePongView: ScreenSaverView {
                                    end: CGPoint(x: 0, y: 0),
                                    options: [])
         } else {
-            bgTop.color.setFill()
-            bounds.fill()
+            ctx.setFillColor(bgTop.color.cgColor)
+            ctx.fill(bounds)
         }
     }
 

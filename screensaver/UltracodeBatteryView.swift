@@ -102,6 +102,20 @@ public final class UltracodeBatteryView: ScreenSaverView {
     private var floorColor = RGB(0x34313A).color   // neutral empty-cell color (scales with config.floor)
     private let colorLevels = 32
 
+    // Pre-rendered empty lattice (bg gradient + every cell at the floor
+    // color), blitted once per frame instead of filling thousands of
+    // floor cells individually. Rebuilt by rebuildGrid().
+    private var floorImage: CGImage?
+
+    // Pre-rendered LIT lattice (bg gradient + every cell at the solid lit
+    // color of the active palette). The charge gauge is a contiguous block
+    // of identical cells, so the lit region is one clipped blit of this
+    // image — CoreGraphics' CPU rasterizer fills ~20k rounded-rect subpaths
+    // at ~15 µs/cell, but blits the same area in ~0.2 ms. Built lazily and
+    // cached per palette (green/yellow/red switch only on state changes).
+    private var litImage: CGImage?
+    private var litImagePalette = -1   // 0 = green, 1 = yellow, 2 = red
+
     // MARK: - Battery state
 
     // The grid is a solid, linear charge gauge: cells light bottom-to-top,
@@ -273,9 +287,63 @@ public final class UltracodeBatteryView: ScreenSaverView {
         // lands EXACTLY on the legacy 0x34313A.
         floorColor = RGB.lerp(RGB(0x232126), RGB(0x676176),
                               min(max(f * 2.5, 0), 1)).color
+        rebuildFloorImage()
+        litImage = nil
+        litImagePalette = -1
 
         refreshBattery()
         shownPct = targetPct
+    }
+
+    /// Renders the entire lattice (background gradient + all cells at the
+    /// given color) into a Retina-scale CGImage.
+    private func renderLattice(cellColor: NSColor) -> CGImage? {
+        let w = bounds.width, h = bounds.height
+        guard w >= 1, h >= 1 else { return nil }
+        let scale = window?.backingScaleFactor ?? 2
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let ctx = CGContext(data: nil,
+                                  width: Int(w * scale), height: Int(h * scale),
+                                  bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: space,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return nil }
+        ctx.scaleBy(x: scale, y: scale)
+
+        // Background gradient — identical to drawBackground().
+        let colors = [bgTop.color.cgColor, bgBottom.color.cgColor] as CFArray
+        if let grad = CGGradient(colorsSpace: space, colors: colors, locations: [0, 1]) {
+            ctx.drawLinearGradient(grad,
+                                   start: CGPoint(x: 0, y: h),
+                                   end: CGPoint(x: 0, y: 0),
+                                   options: [])
+        } else {
+            ctx.setFillColor(bgTop.color.cgColor)
+            ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+        }
+
+        // Every cell at the given color. Cells are filled per-cell: the CPU
+        // rasterizer's fast path beats one giant multi-subpath fill here.
+        let corner = cellSide * 0.28
+        ctx.setFillColor(cellColor.cgColor)
+        for j in 0..<rows {
+            let cy = originY + CGFloat(j) * pitch
+            for i in 0..<cols {
+                let cx = originX + CGFloat(i) * pitch
+                let rect = CGRect(x: cx - cellSide / 2, y: cy - cellSide / 2,
+                                  width: cellSide, height: cellSide)
+                ctx.addPath(CGPath(roundedRect: rect, cornerWidth: corner,
+                                   cornerHeight: corner, transform: nil))
+                ctx.fillPath()
+            }
+        }
+        return ctx.makeImage()
+    }
+
+    /// Pre-renders the empty lattice. draw(_:) blits it as the first step,
+    /// so per-frame work covers only the lit cells.
+    private func rebuildFloorImage() {
+        floorImage = renderLattice(cellColor: floorColor)
     }
 
     public override func setFrameSize(_ newSize: NSSize) {
@@ -350,12 +418,20 @@ public final class UltracodeBatteryView: ScreenSaverView {
     public override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
         if greenColors.isEmpty { rebuildGrid() }
+        if floorImage == nil { rebuildFloorImage() }
 
-        drawBackground(ctx)
+        // One blit paints the background gradient AND every cell at the
+        // empty floor color; only lit cells are drawn on top of it.
+        if let floor = floorImage {
+            ctx.draw(floor, in: bounds)
+        } else {
+            drawBackground(ctx)
+        }
 
         // Apple-standard state colors: red <= 20%, yellow in Low Power Mode,
         // green otherwise (including while charging).
         let low = shownPct <= 0.20
+        let paletteIndex = low ? 2 : (lowPowerMode ? 1 : 0)
         let palette = low ? redColors : (lowPowerMode ? yellowColors : greenColors)
         let f = CGFloat(config.floor)
 
@@ -364,47 +440,125 @@ public final class UltracodeBatteryView: ScreenSaverView {
         // its slice is nearly spent, then flickers like a dying bulb for the
         // last stretch and switches off.
         let total = cols * rows
+        guard total > 0 else { return }
         let exact = CGFloat(shownPct) * CGFloat(total)
         let fullCells = min(total, Int(exact))
         let frac = min(1, max(0, exact - CGFloat(fullCells)))
         // While charging, the cell currently filling pulses on and off.
         let chargePulse = CGFloat(0.18 + 0.62 * (0.5 + 0.5 * sin(phase * 2.6)))
 
-        for j in 0..<rows {
-            let cy = originY + CGFloat(j) * pitch
-            for i in 0..<cols {
-                let cx = originX + CGFloat(i) * pitch
-                let n = j * cols + i        // fill order index (row 0 = bottom)
-
-                var b: CGFloat
-                var glow = false
-                if n < fullCells {
-                    b = 0.82                // solid, always full brightness
-                } else if n == fullCells && n < total {
-                    if charging {
-                        b = chargePulse     // cell "charging in"
-                        glow = true
-                    } else if frac > 0.30 {
-                        b = 0.82            // still burning solid
-                    } else {
-                        // Last stretch of the slice: dying-bulb flicker,
-                        // then out.
-                        b = 0.82 * flicker
-                        glow = flicker > 0.75
-                    }
-                } else {
-                    b = f                   // empty (configured floor)
-                }
-
-                // Empty cells keep the neutral dark floor; the state color
-                // applies only to lit cells.
-                let color = b <= f + 0.02 ? floorColor
-                    : palette[min(colorLevels - 1, max(0, Int(b * CGFloat(colorLevels - 1))))]
-                // Bloom only on the boundary cell — blooming the whole solid
-                // fill would mean thousands of shadows per frame.
-                drawCell(ctx, x: cx, y: cy, color: color,
-                         bloom: config.bloom && glow)
+        // The solid fill (cells 0..<fullCells, all at the same lit color) is
+        // a contiguous block of full rows plus part of one row: blit the
+        // pre-rendered lit lattice clipped to exactly that region. The clip
+        // edges run through the gaps between cells and the lit image carries
+        // the same background gradient, so no seams or cut cells appear.
+        // (CG's CPU rasterizer fills ~20k rounded-rect subpaths at ~15 µs
+        // each — batched path fills cannot reach 60 fps here; blits can.)
+        let solidLevel = min(colorLevels - 1,
+                             max(0, Int(0.82 * CGFloat(colorLevels - 1))))
+        var firstDynamic = 0    // first cell index NOT covered by the lit blit
+        if fullCells > 0 {
+            if litImage == nil || litImagePalette != paletteIndex {
+                litImage = renderLattice(cellColor: palette[solidLevel])
+                litImagePalette = paletteIndex
             }
+            if let lit = litImage {
+                let fullRows = fullCells / cols     // rows completely lit
+                let partial = fullCells % cols      // lit cells in row fullRows
+                let yCut = min(bounds.height,
+                               max(0, originY + (CGFloat(fullRows) - 0.5) * pitch))
+                var clip: [CGRect] = []
+                if fullRows > 0 {
+                    clip.append(CGRect(x: 0, y: 0,
+                                       width: bounds.width, height: yCut))
+                }
+                if partial > 0 {
+                    let xCut = min(bounds.width,
+                                   max(0, originX + (CGFloat(partial) - 0.5) * pitch))
+                    clip.append(CGRect(x: 0, y: yCut, width: xCut, height: pitch))
+                }
+                if !clip.isEmpty {
+                    ctx.saveGState()
+                    ctx.clip(to: clip)
+                    ctx.draw(lit, in: bounds)
+                    ctx.restoreGState()
+                }
+                firstDynamic = fullCells
+            }
+        }
+
+        // Remaining dynamic cells — normally just the boundary cell (or the
+        // whole solid block if the lit image could not be built): batched
+        // into ONE fill path per quantized color level instead of one path
+        // fill per cell. Cells at the floor level are skipped (the floor
+        // blit already shows them); bloomed cells are drawn individually on
+        // top, after the batched fills.
+        var levelPaths: [Int: CGMutablePath] = [:]
+        var bloomCells: [(x: CGFloat, y: CGFloat, color: NSColor)] = []
+        let corner = cellSide * 0.28
+        let lastDynamic = min(fullCells, total - 1)
+
+        // n = fill order index (row 0 = bottom).
+        for n in stride(from: firstDynamic, through: lastDynamic, by: 1) {
+            let i = n % cols
+            let j = n / cols
+            let cx = originX + CGFloat(i) * pitch
+            let cy = originY + CGFloat(j) * pitch
+
+            var b: CGFloat
+            var glow = false
+            if n < fullCells {
+                b = 0.82                    // solid, always full brightness
+            } else if n == fullCells && n < total {
+                if charging {
+                    b = chargePulse         // cell "charging in"
+                    glow = true
+                } else if frac > 0.30 {
+                    b = 0.82                // still burning solid
+                } else {
+                    // Last stretch of the slice: dying-bulb flicker,
+                    // then out.
+                    b = 0.82 * flicker
+                    glow = flicker > 0.75
+                }
+            } else {
+                b = f                       // empty (configured floor)
+            }
+
+            // Empty cells keep the neutral dark floor; the state color
+            // applies only to lit cells.
+            let isFloor = b <= f + 0.02
+            let color = isFloor ? floorColor
+                : palette[min(colorLevels - 1, max(0, Int(b * CGFloat(colorLevels - 1))))]
+            // Bloom only on the boundary cell — blooming the whole solid
+            // fill would mean thousands of shadows per frame. Bloomed cells
+            // are drawn individually, on top, after the batched fills.
+            if config.bloom && glow {
+                bloomCells.append((cx, cy, color))
+            } else if !isFloor {
+                let level = min(colorLevels - 1,
+                                max(0, Int(b * CGFloat(colorLevels - 1))))
+                let rect = CGRect(x: cx - cellSide / 2, y: cy - cellSide / 2,
+                                  width: cellSide, height: cellSide)
+                let cell = CGPath(roundedRect: rect, cornerWidth: corner,
+                                  cornerHeight: corner, transform: nil)
+                if let path = levelPaths[level] {
+                    path.addPath(cell)
+                } else {
+                    let path = CGMutablePath()
+                    path.addPath(cell)
+                    levelPaths[level] = path
+                }
+            }
+        }
+
+        for (level, path) in levelPaths {
+            ctx.setFillColor(palette[level].cgColor)
+            ctx.addPath(path)
+            ctx.fillPath()
+        }
+        for cell in bloomCells {
+            drawCell(ctx, x: cell.x, y: cell.y, color: cell.color, bloom: true)
         }
     }
 

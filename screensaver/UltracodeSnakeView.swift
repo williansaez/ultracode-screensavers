@@ -115,6 +115,10 @@ public final class UltracodeSnakeView: ScreenSaverView {
     private var levelColors: [NSColor] = []
     private let colorLevels = 32
 
+    /// Background gradient + every cell at the floor level, pre-rendered at
+    /// Retina scale. Blitted once per frame instead of ~20k path fills.
+    private var floorImage: CGImage?
+
     // MARK: - Snake state
 
     // Self-playing Snake. The whole grid is the board; the edges are walls.
@@ -202,7 +206,60 @@ public final class UltracodeSnakeView: ScreenSaverView {
 
         waveTotal = max(3, Int(config.fps * 0.2))
         deathTotal = max(10, Int(config.fps))
+        rebuildFloorImage()
         respawnSnake()
+    }
+
+    /// Renders the empty lattice (bg gradient + all cells at the floor
+    /// brightness) once into a CGImage. Rebuilt with the grid, so resize and
+    /// the "Brilho do fundo" slider keep working.
+    private func rebuildFloorImage() {
+        floorImage = nil
+        let w = bounds.width, h = bounds.height
+        guard w >= 1, h >= 1, !levelColors.isEmpty,
+              let space = CGColorSpace(name: CGColorSpace.sRGB) else { return }
+        let scale = window?.backingScaleFactor ?? 2
+        guard let ctx = CGContext(
+            data: nil,
+            width: Int(w * scale), height: Int(h * scale),
+            bitsPerComponent: 8, bytesPerRow: 0, space: space,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return }
+        ctx.scaleBy(x: scale, y: scale)
+
+        // Same gradient as drawBackground().
+        let colors = [bgTop.color.cgColor, bgBottom.color.cgColor] as CFArray
+        if let grad = CGGradient(colorsSpace: space, colors: colors,
+                                 locations: [0, 1]) {
+            ctx.drawLinearGradient(grad,
+                                   start: CGPoint(x: 0, y: h),
+                                   end: CGPoint(x: 0, y: 0),
+                                   options: [])
+        } else {
+            ctx.setFillColor(bgTop.color.cgColor)
+            ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+        }
+
+        // All cells at the floor brightness, one batched fill. Quantized
+        // exactly like draw(_:) does for b == floor.
+        let f = CGFloat(config.floor)
+        let lvl = min(colorLevels - 1, max(0, Int(f * CGFloat(colorLevels - 1))))
+        let radius = cellSide * 0.28
+        let path = CGMutablePath()
+        for i in 0..<cols {
+            let cx = originX + CGFloat(i) * pitch
+            for j in 0..<rows {
+                let cy = originY + CGFloat(j) * pitch
+                let rect = CGRect(x: cx - cellSide / 2, y: cy - cellSide / 2,
+                                  width: cellSide, height: cellSide)
+                path.addPath(CGPath(roundedRect: rect, cornerWidth: radius,
+                                    cornerHeight: radius, transform: nil))
+            }
+        }
+        ctx.setFillColor(levelColors[lvl].cgColor)
+        ctx.addPath(path)
+        ctx.fillPath()
+        floorImage = ctx.makeImage()
     }
 
     public override func setFrameSize(_ newSize: NSSize) {
@@ -438,9 +495,15 @@ public final class UltracodeSnakeView: ScreenSaverView {
 
     public override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
-        if levelColors.isEmpty { rebuildGrid() }
+        if levelColors.isEmpty || floorImage == nil { rebuildGrid() }
 
-        drawBackground(ctx)
+        // Floor blit: bg gradient + every empty cell, pre-rendered once in
+        // rebuildGrid(). Replaces ~20k per-frame path fills.
+        if let floor = floorImage {
+            ctx.draw(floor, in: bounds)
+        } else {
+            drawBackground(ctx)
+        }
 
         let total = cols * rows
         var bodyIndex = [Int32](repeating: -1, count: total)
@@ -454,53 +517,75 @@ public final class UltracodeSnakeView: ScreenSaverView {
             ? CGFloat(waveTick) / CGFloat(max(1, waveTotal)) * CGFloat(n)
             : -100
         let f = CGFloat(config.floor)
+        let floorLvl = min(colorLevels - 1,
+                           max(0, Int(f * CGFloat(colorLevels - 1))))
+        let radius = cellSide * 0.28
 
-        for i in 0..<cols {
-            let cx = originX + CGFloat(i) * pitch
-            for j in 0..<rows {
-                let cy = originY + CGFloat(j) * pitch
-                let idx = j * cols + i
-                let bi = Int(bodyIndex[idx])
+        // Only the body and the food differ from the floor blit. Batch the
+        // body cells by quantized level (one fill per level present);
+        // bloomed cells are drawn individually ON TOP (few, need the shadow).
+        var batches = [CGMutablePath?](repeating: nil, count: colorLevels)
+        var bloomCells: [(x: CGFloat, y: CGFloat, color: NSColor)] = []
 
-                var b: CGFloat = f
-                var bloom = false
-                if bi >= 0 {
-                    if dying {
-                        // White-ish flash that dissolves back into the grid.
-                        b = 0.98 + (f - 0.98) * deathT
-                    } else if bi == 0 {
-                        b = 0.95
-                        bloom = config.bloom
-                    } else {
-                        // Body gradient down the ramp toward the tail.
-                        let t = CGFloat(bi) / CGFloat(max(1, n - 1))
-                        b = 0.90 - 0.45 * t
-                        if abs(CGFloat(bi) - wavePos) < 1.6 {
-                            b = min(1.0, b + 0.35)
-                            bloom = config.bloom
-                        }
-                    }
-                }
-                var foodCell = false
-                if bi < 0 && idx == food && food >= 0 {
-                    // Food: theme contrast accent, soft pulse, bloom.
-                    b = 0.86 + 0.12 * (0.5 + 0.5 * sin(pulse * 2))
-                    bloom = config.bloom && !dying
-                    foodCell = true
-                }
-
-                let color: NSColor
-                if foodCell {
-                    let a = contrastAccent(forTheme: config.theme)
-                    color = NSColor(srgbRed: a.r * b, green: a.g * b,
-                                    blue: a.b * b, alpha: 1)
-                } else {
-                    let lvl = min(colorLevels - 1,
-                                  max(0, Int(b * CGFloat(colorLevels - 1))))
-                    color = levelColors[lvl]
-                }
-                drawCell(ctx, x: cx, y: cy, color: color, bloom: bloom)
+        for (i, idx) in snake.enumerated() {
+            guard idx >= 0, idx < total, Int(bodyIndex[idx]) == i else {
+                continue
             }
+            var b: CGFloat
+            var bloom = false
+            if dying {
+                // White-ish flash that dissolves back into the grid.
+                b = 0.98 + (f - 0.98) * deathT
+            } else if i == 0 {
+                b = 0.95
+                bloom = config.bloom
+            } else {
+                // Body gradient down the ramp toward the tail.
+                let t = CGFloat(i) / CGFloat(max(1, n - 1))
+                b = 0.90 - 0.45 * t
+                if abs(CGFloat(i) - wavePos) < 1.6 {
+                    b = min(1.0, b + 0.35)
+                    bloom = config.bloom
+                }
+            }
+            let lvl = min(colorLevels - 1,
+                          max(0, Int(b * CGFloat(colorLevels - 1))))
+            let cx = originX + CGFloat(idx % cols) * pitch
+            let cy = originY + CGFloat(idx / cols) * pitch
+            if bloom {
+                bloomCells.append((cx, cy, levelColors[lvl]))
+            } else if lvl != floorLvl {
+                // Cells AT the floor level are already in the blit.
+                let path = batches[lvl] ?? CGMutablePath()
+                let rect = CGRect(x: cx - cellSide / 2, y: cy - cellSide / 2,
+                                  width: cellSide, height: cellSide)
+                path.addPath(CGPath(roundedRect: rect, cornerWidth: radius,
+                                    cornerHeight: radius, transform: nil))
+                batches[lvl] = path
+            }
+        }
+
+        for lvl in 0..<colorLevels {
+            guard let path = batches[lvl] else { continue }
+            ctx.setFillColor(levelColors[lvl].cgColor)
+            ctx.addPath(path)
+            ctx.fillPath()
+        }
+
+        for cell in bloomCells {
+            drawCell(ctx, x: cell.x, y: cell.y, color: cell.color, bloom: true)
+        }
+
+        // Food: theme contrast accent, soft pulse, bloom. Single cell.
+        if food >= 0, food < total, bodyIndex[food] < 0 {
+            let b = 0.86 + 0.12 * (0.5 + 0.5 * sin(pulse * 2))
+            let a = contrastAccent(forTheme: config.theme)
+            let color = NSColor(srgbRed: a.r * b, green: a.g * b,
+                                blue: a.b * b, alpha: 1)
+            let cx = originX + CGFloat(food % cols) * pitch
+            let cy = originY + CGFloat(food / cols) * pitch
+            drawCell(ctx, x: cx, y: cy, color: color,
+                     bloom: config.bloom && !dying)
         }
     }
 

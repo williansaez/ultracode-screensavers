@@ -137,10 +137,16 @@ public final class UltracodeBoidsView: ScreenSaverView {
 
     /// Precomputed colors: trail brightness quantized to 64 levels.
     private var trailColors: [NSColor] = []
+    private var trailCGColors: [CGColor] = []
     private var floorColor: NSColor = .black
     private var headColor: NSColor = .white
     private var predatorColor: NSColor = .white
     private let trailLevels = 64
+
+    /// Pre-rendered empty lattice (bg gradient + every cell at floor color),
+    /// blitted as the first drawing step each frame instead of filling
+    /// thousands of floor cells individually. Rebuilt by rebuildGrid().
+    private var floorImage: CGImage?
 
     private var rngState: UInt64 = 0x9E3779B97F4A7C15
     private func nextRand() -> UInt64 {
@@ -218,6 +224,7 @@ public final class UltracodeBoidsView: ScreenSaverView {
             let t = CGFloat(k) / CGFloat(trailLevels - 1)
             return ramp(f + (0.88 - f) * t, stops: stops).color
         }
+        trailCGColors = trailColors.map(\.cgColor)
         headColor = ramp(1.0, stops: stops).color
         // Predator in a contrasting color per theme so it reads instantly:
         // lavanda -> yellow, Doom -> blue, Matrix -> red.
@@ -231,9 +238,50 @@ public final class UltracodeBoidsView: ScreenSaverView {
         boidCount = min(280, max(16, (cols * rows) / 26))
 
         trail = .init(repeating: 0, count: cols * rows)
+        rebuildFloorImage()
         seedFlock()
         predatorFramesLeft = 0
         framesToNextPredator = Int(config.fps * (12.0 + 6.0 * Double(randF())))
+    }
+
+    /// Render the empty lattice (background gradient + all cells at the
+    /// floor color) once into a CGImage at Retina scale.
+    private func rebuildFloorImage() {
+        floorImage = nil
+        let scale = window?.backingScaleFactor ?? 2
+        let pw = Int((bounds.width * scale).rounded())
+        let ph = Int((bounds.height * scale).rounded())
+        guard pw > 0, ph > 0,
+              let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let ctx = CGContext(
+                  data: nil, width: pw, height: ph,
+                  bitsPerComponent: 8, bytesPerRow: 0, space: space,
+                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return }
+        ctx.scaleBy(x: scale, y: scale)
+        drawBackground(ctx)
+        let path = CGMutablePath()
+        for j in 0..<rows {
+            let cy = originY + CGFloat(j) * pitch
+            for i in 0..<cols {
+                path.addPath(cellPath(x: originX + CGFloat(i) * pitch, y: cy))
+            }
+        }
+        ctx.setFillColor(floorColor.cgColor)
+        ctx.addPath(path)
+        ctx.fillPath()
+        floorImage = ctx.makeImage()
+    }
+
+    /// Rounded-rect path for one standard-size cell centered at (x, y).
+    @inline(__always)
+    private func cellPath(x: CGFloat, y: CGFloat) -> CGPath {
+        let side = cellSide
+        return CGPath(
+            roundedRect: CGRect(x: x - side / 2, y: y - side / 2,
+                                width: side, height: side),
+            cornerWidth: side * 0.28, cornerHeight: side * 0.28,
+            transform: nil)
     }
 
     /// Spawn the flock in a few loose clusters with a shared heading per
@@ -395,34 +443,65 @@ public final class UltracodeBoidsView: ScreenSaverView {
 
     public override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
-        if trail.isEmpty { rebuildGrid() }
+        if trail.isEmpty || floorImage == nil { rebuildGrid() }
 
-        drawBackground(ctx)
+        // 1. Blit the pre-rendered empty lattice (bg + all floor cells).
+        if let floorImage {
+            ctx.draw(floorImage, in: bounds)
+        } else {
+            drawBackground(ctx)
+        }
 
+        // 2. Dynamic trail cells, batched into one fill per quantized color
+        //    level (floor cells are skipped: the blit already shows them).
         let maxLevel = Float(trailLevels - 1)
+        var levelPaths = [CGMutablePath?](repeating: nil, count: trailLevels)
         for j in 0..<rows {
             let cy = originY + CGFloat(j) * pitch
             let rowBase = j * cols
             for i in 0..<cols {
                 let v = trail[rowBase + i]
-                let cx = originX + CGFloat(i) * pitch
-                if v <= 0 {
-                    drawCell(ctx, x: cx, y: cy, color: floorColor, bloom: false)
+                if v <= 0 { continue }
+                let level = Int(min(v, 1) * maxLevel)
+                let path: CGMutablePath
+                if let existing = levelPaths[level] {
+                    path = existing
                 } else {
-                    let level = Int(min(v, 1) * maxLevel)
-                    drawCell(ctx, x: cx, y: cy, color: trailColors[level],
-                             bloom: false)
+                    path = CGMutablePath()
+                    levelPaths[level] = path
                 }
+                path.addPath(cellPath(x: originX + CGFloat(i) * pitch, y: cy))
             }
         }
+        for level in 0..<trailLevels {
+            guard let path = levelPaths[level] else { continue }
+            ctx.setFillColor(trailCGColors[level])
+            ctx.addPath(path)
+            ctx.fillPath()
+        }
 
-        // Heads on top: the only bloomed cells (≤ boidCount per frame).
-        for b in boids {
-            let ci = wrap(Int(b.x), cols)
-            let cj = wrap(Int(b.y), rows)
-            let cx = originX + CGFloat(ci) * pitch
-            let cy = originY + CGFloat(cj) * pitch
-            drawCell(ctx, x: cx, y: cy, color: headColor, bloom: config.bloom)
+        // 3. Heads on top: the only bloomed cells (≤ boidCount per frame).
+        //    With bloom off they are all the same color -> one batched fill.
+        if config.bloom {
+            for b in boids {
+                let ci = wrap(Int(b.x), cols)
+                let cj = wrap(Int(b.y), rows)
+                let cx = originX + CGFloat(ci) * pitch
+                let cy = originY + CGFloat(cj) * pitch
+                drawCell(ctx, x: cx, y: cy, color: headColor, bloom: true)
+            }
+        } else {
+            let headPath = CGMutablePath()
+            for b in boids {
+                let ci = wrap(Int(b.x), cols)
+                let cj = wrap(Int(b.y), rows)
+                headPath.addPath(cellPath(
+                    x: originX + CGFloat(ci) * pitch,
+                    y: originY + CGFloat(cj) * pitch))
+            }
+            ctx.setFillColor(headColor.cgColor)
+            ctx.addPath(headPath)
+            ctx.fillPath()
         }
 
         // Predator point while the scatter is on.
@@ -445,8 +524,8 @@ public final class UltracodeBoidsView: ScreenSaverView {
                                    end: CGPoint(x: 0, y: 0),
                                    options: [])
         } else {
-            bgTop.color.setFill()
-            bounds.fill()
+            ctx.setFillColor(bgTop.color.cgColor)
+            ctx.fill(bounds)
         }
     }
 

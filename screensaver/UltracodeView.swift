@@ -1,3 +1,4 @@
+import Accelerate
 import AppKit
 import ScreenSaver
 
@@ -104,6 +105,13 @@ public final class UltracodeView: ScreenSaverView {
     // Heat level -> NSColor, precomputed per grid rebuild (avoids
     // thousands of NSColor allocations per frame).
     private var levelColors: [NSColor] = []
+    // CGColor twins of levelColors for the batched per-level CG fills.
+    private var levelCGColors: [CGColor] = []
+    // Pre-rendered empty lattice (bg gradient + every cell at floor
+    // brightness). Blitted once per frame instead of filling thousands
+    // of floor cells individually. Rebuilt by rebuildGrid(), so it
+    // tracks resizes and the "Brilho do fundo" slider.
+    private var floorImage: CGImage?
 
     // MARK: - Grid + fire state
 
@@ -195,6 +203,184 @@ public final class UltracodeView: ScreenSaverView {
             }
             return ramp(b, stops: stops).color
         }
+        levelCGColors = levelColors.map(\.cgColor)
+        rebuildFloorImage()
+        rebuildSprites()
+    }
+
+    /// Renders the whole empty lattice (background gradient + every cell
+    /// at floor brightness) into a Retina-scale CGImage, once per grid
+    /// rebuild. draw(_:) blits it as its first step.
+    private func rebuildFloorImage() {
+        floorImage = nil
+        let w = bounds.width, h = bounds.height
+        guard w >= 1, h >= 1, !levelCGColors.isEmpty,
+              let space = CGColorSpace(name: CGColorSpace.sRGB) else { return }
+        let scale = window?.backingScaleFactor ?? 2
+        guard let ctx = CGContext(
+            data: nil,
+            width: Int(w * scale), height: Int(h * scale),
+            bitsPerComponent: 8, bytesPerRow: 0, space: space,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return }
+        ctx.scaleBy(x: scale, y: scale)
+
+        // Same background gradient as drawBackground().
+        let colors = [bgTop.color.cgColor, bgBottom.color.cgColor] as CFArray
+        if let grad = CGGradient(colorsSpace: space, colors: colors, locations: [0, 1]) {
+            ctx.drawLinearGradient(grad,
+                                   start: CGPoint(x: 0, y: h),
+                                   end: CGPoint(x: 0, y: 0),
+                                   options: [])
+        } else {
+            ctx.setFillColor(bgTop.color.cgColor)
+            ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+        }
+
+        // Every cell at floor brightness, batched into a single fill.
+        let radius = cellSide * 0.28
+        let path = CGMutablePath()
+        for j in 0..<rows {
+            let cy = originY + CGFloat(j) * pitch
+            for i in 0..<cols {
+                let cx = originX + CGFloat(i) * pitch
+                path.addPath(CGPath(
+                    roundedRect: CGRect(x: cx - cellSide / 2, y: cy - cellSide / 2,
+                                        width: cellSide, height: cellSide),
+                    cornerWidth: radius, cornerHeight: radius, transform: nil))
+            }
+        }
+        ctx.setFillColor(levelCGColors[0])
+        ctx.addPath(path)
+        ctx.fillPath()
+
+        floorImage = ctx.makeImage()
+    }
+
+    // MARK: - Sprite compositor
+
+    // The dynamic cells are batched by quantized heat level: each level
+    // gets ONE pre-rendered sprite tile (rounded cell at the level color;
+    // bloom levels additionally get a body+glow tile with the CG shadow
+    // baked in), kept as raw premultiplied-RGBA pixels at backing scale.
+    // draw() composites the frame's dynamic cells into a reusable scratch
+    // buffer on the CPU (vImage premultiplied alpha-over, in the exact
+    // row-major order of the old per-cell CG fills — "over" is associative,
+    // so compositing into the buffer first and blitting once is pixel-
+    // equivalent) and then draws the composite with a single CG blit.
+    // Rationale: per-cell CG path fills measure ~4 us/cell and per-cell
+    // shadowed bloom draws ~16 us/cell (~90 ms/frame total at pitch 8);
+    // the CPU compositor brings the same image to a few ms.
+    private final class SpriteTile {
+        let ctx: CGContext            // owns the pixel storage
+        let data: UnsafeMutableRawPointer
+        let w: Int, h: Int, rowBytes: Int
+        let padPx: Int                // margin around the cell box (glow spill)
+        init?(sidePx: CGFloat, phaseX: CGFloat, phaseY: CGFloat, padPx: Int,
+              draw: (CGContext, CGRect) -> Void) {
+            let w = padPx * 2 + Int((phaseX + sidePx).rounded(.up)) + 1
+            let h = padPx * 2 + Int((phaseY + sidePx).rounded(.up)) + 1
+            guard w > 0, h > 0,
+                  let space = CGColorSpace(name: CGColorSpace.sRGB),
+                  let c = CGContext(
+                      data: nil, width: w, height: h,
+                      bitsPerComponent: 8, bytesPerRow: 0, space: space,
+                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
+                  let d = c.data else { return nil }
+            draw(c, CGRect(x: CGFloat(padPx) + phaseX, y: CGFloat(padPx) + phaseY,
+                           width: sidePx, height: sidePx))
+            self.ctx = c; self.data = d; self.w = w; self.h = h
+            self.rowBytes = c.bytesPerRow; self.padPx = padPx
+        }
+    }
+
+    private var cellSprites: [SpriteTile?] = []
+    private var bloomSprites: [SpriteTile?] = []
+    private var frameBuf: [UInt8] = []
+    private var bufW = 0
+    private var bufH = 0
+    private var bufScale: CGFloat = 2
+
+    private func rebuildSprites() {
+        cellSprites = []
+        bloomSprites = []
+        frameBuf = []
+        guard !levelCGColors.isEmpty, bounds.width >= 1, bounds.height >= 1 else { return }
+        let scale = window?.backingScaleFactor ?? 2
+        bufScale = scale
+        bufW = Int(bounds.width * scale)
+        bufH = Int(bounds.height * scale)
+        guard bufW > 0, bufH > 0 else { return }
+
+        let sidePx = cellSide * scale
+        let radiusPx = cellSide * 0.28 * scale
+        // Sub-pixel phase of cell (0,0)'s box, baked into the tiles so the
+        // integer-pixel stamping lands exactly where the CG path fills did.
+        // (pitch*scale is integral for the slider detents, so the phase is
+        // shared by every cell; for fractional pitches the drift stays
+        // under one device pixel.)
+        let phaseX = ((originX - cellSide / 2) * scale).truncatingRemainder(dividingBy: 1)
+        let phaseY = ((originY - cellSide / 2) * scale).truncatingRemainder(dividingBy: 1)
+        let px = phaseX < 0 ? phaseX + 1 : phaseX
+        let py = phaseY < 0 ? phaseY + 1 : phaseY
+
+        let bloomCut = Int(CGFloat(levels - 1) * 0.82)
+        let blurPx = cellSide * 1.2 * scale
+        let bloomPadPx = Int((blurPx * 2).rounded(.up)) + 1
+
+        cellSprites = (0..<levels).map { h in
+            SpriteTile(sidePx: sidePx, phaseX: px, phaseY: py, padPx: 0) { c, rect in
+                c.setFillColor(self.levelCGColors[h])
+                c.addPath(CGPath(roundedRect: rect, cornerWidth: radiusPx,
+                                 cornerHeight: radiusPx, transform: nil))
+                c.fillPath()
+            }
+        }
+        bloomSprites = (0..<levels).map { h in
+            guard h >= bloomCut else { return nil }
+            return SpriteTile(sidePx: sidePx, phaseX: px, phaseY: py,
+                              padPx: bloomPadPx) { c, rect in
+                c.setShadow(offset: .zero, blur: blurPx,
+                            color: self.levelColors[h].withAlphaComponent(0.8).cgColor)
+                c.setFillColor(self.levelCGColors[h])
+                c.addPath(CGPath(roundedRect: rect, cornerWidth: radiusPx,
+                                 cornerHeight: radiusPx, transform: nil))
+                c.fillPath()
+            }
+        }
+        if cellSprites.contains(where: { $0 == nil }) {
+            // Sprite build failed; draw() falls back to per-cell paths.
+            cellSprites = []
+            bloomSprites = []
+            return
+        }
+        frameBuf = [UInt8](repeating: 0, count: bufW * bufH * 4)
+    }
+
+    /// Alpha-over blend of one tile into the scratch buffer at integer
+    /// device-pixel coordinates, clipped to the buffer width and to the
+    /// row band cleared for this frame.
+    private func stamp(_ tile: SpriteTile, x: Int, topRow: Int,
+                       rowLo: Int, rowHi: Int,
+                       base: UnsafeMutableRawPointer) {
+        var sx = 0, sy = 0, w = tile.w, h = tile.h, dx = x, dy = topRow
+        if dx < 0 { sx = -dx; w += dx; dx = 0 }
+        if dy < rowLo { sy = rowLo - dy; h -= rowLo - dy; dy = rowLo }
+        if dx + w > bufW { w = bufW - dx }
+        if dy + h > rowHi { h = rowHi - dy }
+        guard w > 0, h > 0 else { return }
+        var src = vImage_Buffer(data: tile.data + sy * tile.rowBytes + sx * 4,
+                                height: vImagePixelCount(h),
+                                width: vImagePixelCount(w),
+                                rowBytes: tile.rowBytes)
+        var dst = vImage_Buffer(data: base + (dy * bufW + dx) * 4,
+                                height: vImagePixelCount(h),
+                                width: vImagePixelCount(w),
+                                rowBytes: bufW * 4)
+        // _BGRA8888 == the C macro vImagePremultipliedAlphaBlend_RGBA8888:
+        // the premultiplied over-blend only cares that alpha is byte 3.
+        vImagePremultipliedAlphaBlend_BGRA8888(&src, &dst, &dst,
+                                               vImage_Flags(kvImageNoFlags))
     }
 
     public override func setFrameSize(_ newSize: NSSize) {
@@ -206,49 +392,6 @@ public final class UltracodeView: ScreenSaverView {
         loadConfig()
         super.startAnimation()
         rebuildGrid()
-    }
-
-    public override func stopAnimation() {
-        super.stopAnimation()
-        freezeFrameIfNeeded()
-    }
-
-    /// "Macintosh"-style pairing emulation: when the real screensaver stops,
-    /// persist the current frame as a PNG. A LaunchAgent outside the
-    /// legacyScreenSaver sandbox watches this file and applies it as the
-    /// desktop wallpaper, so the desktop (and the login screen, which
-    /// inherits the user wallpaper) freezes on the last frame.
-    private func freezeFrameIfNeeded() {
-        guard !isPreview, bounds.width >= 800, !heat.isEmpty else { return }
-        let scale: CGFloat = 2
-        guard let rep = NSBitmapImageRep(
-            bitmapDataPlanes: nil,
-            pixelsWide: Int(bounds.width * scale),
-            pixelsHigh: Int(bounds.height * scale),
-            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
-            colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
-        ), let gctx = NSGraphicsContext(bitmapImageRep: rep) else { return }
-
-        NSGraphicsContext.saveGraphicsState()
-        NSGraphicsContext.current = gctx
-        gctx.cgContext.scaleBy(x: scale, y: scale)
-        draw(bounds)
-        gctx.flushGraphics()
-        NSGraphicsContext.restoreGraphicsState()
-
-        guard let png = rep.representation(using: .png, properties: [:]) else { return }
-        do {
-            // Inside legacyScreenSaver this resolves into its sandbox
-            // container; in a plain process it is ~/Library/Application
-            // Support. The watcher watches both.
-            let dir = FileManager.default.urls(
-                for: .applicationSupportDirectory, in: .userDomainMask)[0]
-                .appendingPathComponent("Ultracode", isDirectory: true)
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            try png.write(to: dir.appendingPathComponent("lastframe.png"), options: .atomic)
-        } catch {
-            // Sandbox denied the write — pairing simply won't update.
-        }
     }
 
     // MARK: - Doom fire propagation
@@ -290,21 +433,106 @@ public final class UltracodeView: ScreenSaverView {
 
     public override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
-        if heat.isEmpty { rebuildGrid() }
+        if heat.isEmpty || floorImage == nil { rebuildGrid() }
 
-        drawBackground(ctx)
+        // 1. Floor: one blit of the pre-rendered empty lattice replaces the
+        //    background gradient plus thousands of floor-cell fills. Both
+        //    the view's context and the image are bottom-up, so no flip.
+        if let floorImage {
+            ctx.draw(floorImage, in: bounds)
+        } else {
+            drawBackground(ctx)   // degenerate bounds; keep the bg at least
+        }
 
         let bloomCut = Int(CGFloat(levels - 1) * 0.82)
-        for j in 0..<rows {
-            let cy = originY + CGFloat(j) * pitch
-            let rowBase = j * cols
-            for i in 0..<cols {
-                let h = heat[rowBase + i]
-                let cx = originX + CGFloat(i) * pitch
-                drawCell(ctx, x: cx, y: cy,
-                         color: levelColors[min(h, levels - 1)],
-                         bloom: config.bloom && h >= bloomCut)
+
+        // Fallback (sprite build failed): classic one-path-per-cell drawing
+        // for the dynamic cells, floor cells still come from the blit.
+        guard !cellSprites.isEmpty, !frameBuf.isEmpty else {
+            for j in 0..<rows {
+                let cy = originY + CGFloat(j) * pitch
+                let rowBase = j * cols
+                for i in 0..<cols {
+                    let h = min(heat[rowBase + i], levels - 1)
+                    if h == 0 { continue }
+                    drawCell(ctx, x: originX + CGFloat(i) * pitch, y: cy,
+                             color: levelColors[h],
+                             bloom: config.bloom && h >= bloomCut)
+                }
             }
+            return
+        }
+
+        // 2. Dynamic cells (anything brighter than the floor), batched by
+        //    quantized level via the sprite compositor. Cells at the floor
+        //    level are skipped (the blit already shows them). First find
+        //    the affected row band so only that part of the scratch buffer
+        //    is cleared, composited and re-blitted.
+        var minJ = Int.max, maxJ = Int.min
+        for j in 0..<rows {
+            let rowBase = j * cols
+            for i in 0..<cols where heat[rowBase + i] > 0 {
+                if j < minJ { minJ = j }
+                maxJ = j
+                break
+            }
+        }
+        guard minJ <= maxJ else { return }   // everything sits at the floor
+
+        let s = bufScale
+        let cellHalf = cellSide / 2
+        let padPx = config.bloom ? (bloomSprites.compactMap { $0 }.first?.padPx ?? 0) : 0
+        let loPt = originY + CGFloat(minJ) * pitch - cellHalf
+        let hiPt = originY + CGFloat(maxJ) * pitch + cellHalf
+        let ry0 = max(0, bufH - Int((hiPt * s).rounded(.up)) - padPx - 3)
+        let ry1 = min(bufH, bufH - Int((loPt * s).rounded(.down)) + padPx + 3)
+        guard ry0 < ry1 else { return }
+        let bandH = ry1 - ry0
+
+        frameBuf.withUnsafeMutableBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            memset(base + ry0 * bufW * 4, 0, bandH * bufW * 4)
+
+            // Same row-major order as the old per-cell draws; premultiplied
+            // alpha-over is associative, so the final single blit composites
+            // exactly like the individual draws did (bloom glows included,
+            // ON TOP of the plain cells they overlap).
+            for j in minJ...maxJ {
+                let cy = originY + CGFloat(j) * pitch
+                let pyBottom = Int(((cy - cellHalf) * s).rounded(.down))
+                let rowBase = j * cols
+                for i in 0..<cols {
+                    let h = min(heat[rowBase + i], levels - 1)
+                    if h == 0 { continue }
+                    let cx = originX + CGFloat(i) * pitch
+                    let pxLeft = Int(((cx - cellHalf) * s).rounded(.down))
+                    var tile: SpriteTile? = cellSprites[h]
+                    if config.bloom && h >= bloomCut, let b = bloomSprites[h] {
+                        tile = b
+                    }
+                    guard let tile else { continue }
+                    stamp(tile, x: pxLeft - tile.padPx,
+                          topRow: bufH - (pyBottom - tile.padPx) - tile.h,
+                          rowLo: ry0, rowHi: ry1, base: base)
+                }
+            }
+
+            // 3. One blit of the composited band, on top of the floor.
+            guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+                  let provider = CGDataProvider(
+                      dataInfo: nil, data: base + ry0 * bufW * 4,
+                      size: bandH * bufW * 4, releaseData: { _, _, _ in }),
+                  let img = CGImage(
+                      width: bufW, height: bandH,
+                      bitsPerComponent: 8, bitsPerPixel: 32,
+                      bytesPerRow: bufW * 4, space: space,
+                      bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                      provider: provider, decode: nil,
+                      shouldInterpolate: false, intent: .defaultIntent)
+            else { return }
+            ctx.draw(img, in: CGRect(x: 0, y: CGFloat(bufH - ry1) / s,
+                                     width: CGFloat(bufW) / s,
+                                     height: CGFloat(bandH) / s))
         }
     }
 

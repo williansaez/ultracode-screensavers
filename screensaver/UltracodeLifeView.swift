@@ -115,6 +115,40 @@ public final class UltracodeLifeView: ScreenSaverView {
     private var floorColor: NSColor = .black
     private let aliveAgeCap = 12
 
+    /// Pre-rendered empty lattice (bg gradient + every cell at floor
+    /// brightness), kept as a CGImage (single blit in the fallback path)
+    /// and as raw pixels (bulk-copied by the compositor fast path).
+    private var floorImage: CGImage?
+
+    // MARK: Software compositor caches
+    //
+    // At pitch 8 the lattice has ~24k cells and any per-cell CoreGraphics
+    // call (path fill, CGLayer stamp, image stamp) costs 1-25 us -- far
+    // over a 16 ms frame budget. The fast path composes the frame in a
+    // pixel buffer instead: floor pixels are bulk-copied, dynamic cells
+    // are stamped from small pre-rendered tiles (one per quantized color
+    // level), and the finished frame is drawn with a single ctx.draw.
+    // Bloom halos are alpha-blended into a half-resolution overlay (a
+    // Gaussian halo survives upsampling) and composited with one more draw.
+    private var fbScale: CGFloat = 2
+    private var fbW = 0, fbH = 0
+    private var bufSpace: CGColorSpace?     // working space of all buffers
+    private var floorPixels: [UInt8] = []   // RGBA premultiplied
+    private var frameBuf: [UInt8] = []
+    private var coreTiles: [UInt8] = []     // flat: alive levels then trail levels
+    private var coreTileCount = 0
+    private var tilePx = 0
+    private var tileSpans: [(lo: Int, hi: Int)] = []   // non-empty px per tile row
+    private var cellPxX: [Int] = []         // tile origin per column (device px)
+    private var cellPxY: [Int] = []         // tile origin per row (top-down px)
+    private let haloScale: CGFloat = 0.5
+    private var haloW = 0, haloH = 0
+    private var haloBuf: [UInt8] = []
+    private var haloTiles: [UInt8] = []     // flat, indexed by newborn age (0 unused)
+    private var haloTilePx = 0
+    private var haloPxX: [Int] = []
+    private var haloPxY: [Int] = []
+
     // Stagnation detection: hash recent boards; reseed when the world
     // settles into still lifes / short oscillators.
     private var recentHashes: [UInt64] = []
@@ -193,7 +227,211 @@ public final class UltracodeLifeView: ScreenSaverView {
             return ramp(b, stops: stops).color
         }
 
+        rebuildRenderCaches()
         reseed()
+    }
+
+    // MARK: - Render caches
+
+    /// Buffers are rendered and tagged in the destination's color space when
+    /// the view is attached to a window: a full-screen color conversion per
+    /// composite costs several ms per frame otherwise.
+    private func compositorSpace() -> CGColorSpace {
+        if let s = window?.colorSpace?.cgColorSpace, s.model == .rgb,
+           s.numberOfComponents == 3,
+           CGContext(data: nil, width: 1, height: 1, bitsPerComponent: 8,
+                     bytesPerRow: 4, space: s,
+                     bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) != nil {
+            return s
+        }
+        return CGColorSpace(name: CGColorSpace.sRGB)!
+    }
+
+    private func rebuildRenderCaches() {
+        bufSpace = compositorSpace()
+        rebuildFloorImage()
+        rebuildCoreTiles()
+        rebuildHaloTiles()
+        rebuildPixelTables()
+        frameBuf = floorPixels.isEmpty
+            ? [] : [UInt8](repeating: 0, count: floorPixels.count)
+        haloBuf = (haloW > 0 && haloH > 0 && !haloTiles.isEmpty)
+            ? [UInt8](repeating: 0, count: haloW * haloH * 4) : []
+    }
+
+    /// Renders the entire empty lattice (background gradient + floor cells)
+    /// once at Retina scale. Rebuilt with the grid, so resize and the
+    /// "Brilho do fundo" slider keep working.
+    private func rebuildFloorImage() {
+        floorImage = nil
+        floorPixels = []
+        let w = bounds.width, h = bounds.height
+        guard w >= 1, h >= 1 else { return }
+        fbScale = window?.backingScaleFactor ?? 2
+        fbW = Int((w * fbScale).rounded())
+        fbH = Int((h * fbScale).rounded())
+        var pixels = [UInt8](repeating: 0, count: fbW * fbH * 4)
+        let ok: Bool = pixels.withUnsafeMutableBytes { raw in
+            guard let space = bufSpace,
+                  let ctx = CGContext(data: raw.baseAddress,
+                                      width: fbW, height: fbH,
+                                      bitsPerComponent: 8, bytesPerRow: fbW * 4,
+                                      space: space,
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+            else { return false }
+            ctx.scaleBy(x: fbScale, y: fbScale)
+
+            // Same gradient as drawBackground.
+            let colors = [bgTop.color.cgColor, bgBottom.color.cgColor] as CFArray
+            if let grad = CGGradient(colorsSpace: space, colors: colors,
+                                     locations: [0, 1]) {
+                ctx.drawLinearGradient(grad,
+                                       start: CGPoint(x: 0, y: h),
+                                       end: CGPoint(x: 0, y: 0),
+                                       options: [])
+            } else {
+                ctx.setFillColor(bgTop.color.cgColor)
+                ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+            }
+
+            // Every cell at floor brightness.
+            let r = cellSide * 0.28
+            ctx.setFillColor(floorColor.cgColor)
+            for j in 0..<rows {
+                let cy = originY + CGFloat(j) * pitch
+                for i in 0..<cols {
+                    let cx = originX + CGFloat(i) * pitch
+                    ctx.addPath(CGPath(roundedRect: CGRect(x: cx - cellSide / 2,
+                                                           y: cy - cellSide / 2,
+                                                           width: cellSide,
+                                                           height: cellSide),
+                                       cornerWidth: r, cornerHeight: r,
+                                       transform: nil))
+                    ctx.fillPath()
+                }
+            }
+            floorImage = ctx.makeImage()
+            return true
+        }
+        if ok { floorPixels = pixels }
+    }
+
+    /// One small RGBA tile per quantized color level (alive ages then trail
+    /// steps): the same rounded rect drawCell fills, pre-rendered at Retina
+    /// scale with 1 pt of padding for the antialiased edge.
+    private func rebuildCoreTiles() {
+        coreTiles = []
+        tileSpans = []
+        coreTileCount = 0
+        let pad: CGFloat = 1
+        let sidePt = cellSide + 2 * pad
+        tilePx = Int((sidePt * fbScale).rounded(.up))
+        guard tilePx > 0, fbW > 0, let space = bufSpace else { return }
+        let r = cellSide * 0.28
+        let levels = aliveColors + trailColors
+        let stride = tilePx * tilePx * 4
+        var tiles = [UInt8](repeating: 0, count: levels.count * stride)
+        let ok: Bool = tiles.withUnsafeMutableBytes { raw in
+            guard let base = raw.baseAddress else { return false }
+            for (idx, color) in levels.enumerated() {
+                guard let ctx = CGContext(data: base + idx * stride,
+                                          width: tilePx, height: tilePx,
+                                          bitsPerComponent: 8, bytesPerRow: tilePx * 4,
+                                          space: space,
+                                          bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+                else { return false }
+                ctx.scaleBy(x: fbScale, y: fbScale)
+                ctx.setFillColor(color.cgColor)
+                ctx.addPath(CGPath(roundedRect: CGRect(x: pad, y: pad,
+                                                       width: cellSide,
+                                                       height: cellSide),
+                                   cornerWidth: r, cornerHeight: r, transform: nil))
+                ctx.fillPath()
+            }
+            return true
+        }
+        guard ok else { return }
+        coreTiles = tiles
+        coreTileCount = levels.count
+        // All levels share the alpha shape; cache each row's covered span.
+        tileSpans = (0..<tilePx).map { ty in
+            var lo = -1, hi = 0
+            for tx in 0..<tilePx where tiles[(ty * tilePx + tx) * 4 + 3] != 0 {
+                if lo < 0 { lo = tx }
+                hi = tx + 1
+            }
+            return (max(lo, 0), hi)
+        }
+    }
+
+    /// Bloom tiles per newborn age: the exact drawCell(bloom: true) render
+    /// (rounded cell + shadow halo), pre-rendered at half resolution -- a
+    /// Gaussian halo survives the upsample. NB: CG shadow blur is specified
+    /// in device space, so it is scaled by the tile's device scale to match
+    /// the look of the direct render.
+    private func rebuildHaloTiles() {
+        haloTiles = []
+        haloTilePx = 0
+        haloW = 0
+        haloH = 0
+        let w = bounds.width, h = bounds.height
+        guard w >= 1, h >= 1, aliveColors.count > 2,
+              let space = bufSpace else { return }
+        let blur = cellSide * 1.2
+        let margin = blur * 1.5 + 1   // halo alpha is ~0 beyond ~1.0x blur
+        let sidePt = cellSide + 2 * margin
+        let px = Int((sidePt * haloScale).rounded(.up))
+        guard px > 0 else { return }
+        let r = cellSide * 0.28
+        let stride = px * px * 4
+        var tiles = [UInt8](repeating: 0, count: 3 * stride)   // age 0 unused
+        let ok: Bool = tiles.withUnsafeMutableBytes { raw in
+            guard let base = raw.baseAddress else { return false }
+            for age in 1...2 {
+                guard let ctx = CGContext(data: base + age * stride,
+                                          width: px, height: px,
+                                          bitsPerComponent: 8, bytesPerRow: px * 4,
+                                          space: space,
+                                          bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+                else { return false }
+                ctx.scaleBy(x: haloScale, y: haloScale)
+                let color = aliveColors[age]
+                ctx.setShadow(offset: .zero, blur: blur * haloScale,
+                              color: color.withAlphaComponent(0.8).cgColor)
+                ctx.setFillColor(color.cgColor)
+                ctx.addPath(CGPath(roundedRect: CGRect(x: margin, y: margin,
+                                                       width: cellSide,
+                                                       height: cellSide),
+                                   cornerWidth: r, cornerHeight: r, transform: nil))
+                ctx.fillPath()
+            }
+            return true
+        }
+        guard ok else { return }
+        haloTiles = tiles
+        haloTilePx = px
+        haloW = Int((w * haloScale).rounded(.up))
+        haloH = Int((h * haloScale).rounded(.up))
+    }
+
+    /// Per-column / per-row tile origins in device pixels (top-down rows,
+    /// matching CGImage memory order).
+    private func rebuildPixelTables() {
+        let h = bounds.height
+        let tHalf = CGFloat(tilePx) / 2
+        let hHalf = CGFloat(haloTilePx) / 2
+        cellPxX = (0..<cols).map {
+            Int(((originX + CGFloat($0) * pitch) * fbScale - tHalf).rounded())
+        }
+        cellPxY = (0..<rows).map {
+            Int(((h - (originY + CGFloat($0) * pitch)) * fbScale - tHalf).rounded())
+        }
+        haloPxX = (0..<cols).map {
+            Int(((originX + CGFloat($0) * pitch) * haloScale - hHalf).rounded())
+        }
+        haloPxY = (0..<rows).map {
+            Int(((h - (originY + CGFloat($0) * pitch)) * haloScale - hHalf).rounded())
+        }
     }
 
     private func reseed() {
@@ -290,10 +528,184 @@ public final class UltracodeLifeView: ScreenSaverView {
 
     public override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
-        if state.isEmpty { rebuildGrid() }
+        if state.isEmpty || floorImage == nil { rebuildGrid() }
 
-        drawBackground(ctx)
+        guard !frameBuf.isEmpty, !coreTiles.isEmpty,
+              frameBuf.count == floorPixels.count else {
+            drawLegacy(ctx)
+            return
+        }
 
+        // 1. Compose the frame in the pixel buffer: floor blit (bulk copy
+        //    of the pre-rendered lattice), then dynamic cells stamped from
+        //    their per-color-level tiles. Cells at the floor level are
+        //    skipped -- the copy already shows them.
+        var bloomCells: [(i: Int, j: Int, age: Int)] = []
+        let aliveLevelCount = aliveColors.count
+        let bloomOn = config.bloom
+
+        frameBuf.withUnsafeMutableBytes { rawFrame in
+            guard let fBase = rawFrame.baseAddress else { return }
+            _ = floorPixels.withUnsafeBytes { rawFloor in
+                memcpy(fBase, rawFloor.baseAddress!, rawFloor.count)
+            }
+            let f = fBase.assumingMemoryBound(to: UInt8.self)
+            coreTiles.withUnsafeBytes { rawTiles in
+                let tiles = rawTiles.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                for j in 0..<rows {
+                    let py = cellPxY[j]
+                    if py + tilePx <= 0 || py >= fbH { continue }
+                    let rowBase = j * cols
+                    for i in 0..<cols {
+                        let s = state[rowBase + i]
+                        if s == 0 { continue }
+                        let level: Int
+                        if s > 0 {
+                            level = min(s, aliveAgeCap)
+                            if bloomOn && s <= 2 { bloomCells.append((i, j, s)) }
+                        } else {
+                            level = aliveLevelCount + min(-s, trailLength) - 1
+                        }
+                        stampCore(f, tiles, level: level, px: cellPxX[i], py: py)
+                    }
+                }
+            }
+        }
+
+        // 2. One draw for the whole lattice.
+        drawPixelBuffer(ctx, frameBuf, width: fbW, height: fbH,
+                        scale: fbScale, opaque: true)
+
+        // 3. Bloomed newborns on top: their halos are blended into the
+        //    half-resolution overlay and composited in one draw.
+        guard !bloomCells.isEmpty else { return }
+        if haloBuf.isEmpty || haloTiles.isEmpty {
+            for c in bloomCells {
+                drawCell(ctx,
+                         x: originX + CGFloat(c.i) * pitch,
+                         y: originY + CGFloat(c.j) * pitch,
+                         color: aliveColors[min(c.age, aliveAgeCap)], bloom: true)
+            }
+            return
+        }
+        haloBuf.withUnsafeMutableBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            memset(base, 0, raw.count)
+            let h = base.assumingMemoryBound(to: UInt8.self)
+            haloTiles.withUnsafeBytes { rawTiles in
+                let tiles = rawTiles.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                for c in bloomCells {
+                    stampHalo(h, tiles, age: c.age,
+                              px: haloPxX[c.i], py: haloPxY[c.j])
+                }
+            }
+        }
+        drawPixelBuffer(ctx, haloBuf, width: haloW, height: haloH,
+                        scale: haloScale, opaque: false)
+    }
+
+    /// Stamps one cell tile into the frame buffer. Opaque pixels are stored
+    /// directly; antialiased edge pixels are src-over blended (premultiplied).
+    private func stampCore(_ f: UnsafeMutablePointer<UInt8>,
+                           _ tiles: UnsafePointer<UInt8>,
+                           level: Int, px: Int, py: Int) {
+        if px + tilePx <= 0 || px >= fbW { return }
+        let t = tiles + level * tilePx * tilePx * 4
+        let ty0 = max(0, -py), ty1 = min(tilePx, fbH - py)
+        for ty in ty0..<ty1 {
+            var lo = tileSpans[ty].lo, hi = tileSpans[ty].hi
+            if px + lo < 0 { lo = -px }
+            if px + hi > fbW { hi = fbW - px }
+            if lo >= hi { continue }
+            let dRow = ((py + ty) * fbW + px) << 2
+            let tRow = (ty * tilePx) << 2
+            for tx in lo..<hi {
+                let ti = tRow + (tx << 2)
+                let sa = t[ti + 3]
+                if sa == 255 {
+                    let v = UnsafeRawPointer(t + ti).load(as: UInt32.self)
+                    UnsafeMutableRawPointer(f + dRow + (tx << 2))
+                        .storeBytes(of: v, as: UInt32.self)
+                } else if sa != 0 {
+                    let di = dRow + (tx << 2)
+                    let inv = UInt16(255 - sa)
+                    f[di]     = t[ti]     &+ UInt8((UInt16(f[di])     &* inv) / 255)
+                    f[di + 1] = t[ti + 1] &+ UInt8((UInt16(f[di + 1]) &* inv) / 255)
+                    f[di + 2] = t[ti + 2] &+ UInt8((UInt16(f[di + 2]) &* inv) / 255)
+                    f[di + 3] = 255
+                }
+            }
+        }
+    }
+
+    /// Src-over blends one bloom tile into the halo overlay buffer.
+    private func stampHalo(_ h: UnsafeMutablePointer<UInt8>,
+                           _ tiles: UnsafePointer<UInt8>,
+                           age: Int, px: Int, py: Int) {
+        if px + haloTilePx <= 0 || px >= haloW { return }
+        let t = tiles + age * haloTilePx * haloTilePx * 4
+        let ty0 = max(0, -py), ty1 = min(haloTilePx, haloH - py)
+        let tx0 = max(0, -px), tx1 = min(haloTilePx, haloW - px)
+        for ty in ty0..<ty1 {
+            let dRow = ((py + ty) * haloW + px) << 2
+            let tRow = (ty * haloTilePx) << 2
+            for tx in tx0..<tx1 {
+                let ti = tRow + (tx << 2)
+                let sa = t[ti + 3]
+                if sa == 0 { continue }
+                let di = dRow + (tx << 2)
+                if sa == 255 {
+                    let v = UnsafeRawPointer(t + ti).load(as: UInt32.self)
+                    UnsafeMutableRawPointer(h + di).storeBytes(of: v, as: UInt32.self)
+                } else {
+                    let inv = UInt16(255 - sa)
+                    h[di]     = t[ti]     &+ UInt8((UInt16(h[di])     &* inv) / 255)
+                    h[di + 1] = t[ti + 1] &+ UInt8((UInt16(h[di + 1]) &* inv) / 255)
+                    h[di + 2] = t[ti + 2] &+ UInt8((UInt16(h[di + 2]) &* inv) / 255)
+                    h[di + 3] = t[ti + 3] &+ UInt8((UInt16(h[di + 3]) &* inv) / 255)
+                }
+            }
+        }
+    }
+
+    /// Wraps a pixel buffer in a no-copy CGImage and draws it, top-aligned,
+    /// scaled back to points.
+    private func drawPixelBuffer(_ ctx: CGContext, _ buf: [UInt8],
+                                 width: Int, height: Int, scale: CGFloat,
+                                 opaque: Bool) {
+        guard width > 0, height > 0, buf.count >= width * height * 4,
+              let space = bufSpace else { return }
+        buf.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress,
+                  let data = CFDataCreateWithBytesNoCopy(
+                      kCFAllocatorDefault,
+                      base.assumingMemoryBound(to: UInt8.self),
+                      raw.count, kCFAllocatorNull),
+                  let provider = CGDataProvider(data: data) else { return }
+            let info = opaque
+                ? CGImageAlphaInfo.noneSkipLast.rawValue
+                : CGImageAlphaInfo.premultipliedLast.rawValue
+            guard let img = CGImage(width: width, height: height,
+                                    bitsPerComponent: 8, bitsPerPixel: 32,
+                                    bytesPerRow: width * 4, space: space,
+                                    bitmapInfo: CGBitmapInfo(rawValue: info),
+                                    provider: provider, decode: nil,
+                                    shouldInterpolate: true,
+                                    intent: .defaultIntent) else { return }
+            let wPt = CGFloat(width) / scale, hPt = CGFloat(height) / scale
+            ctx.draw(img, in: CGRect(x: 0, y: bounds.height - hPt,
+                                     width: wPt, height: hPt))
+        }
+    }
+
+    /// Original per-cell path, used only if the compositor buffers could
+    /// not be built (e.g. zero-sized bounds).
+    private func drawLegacy(_ ctx: CGContext) {
+        if let floorImage {
+            ctx.draw(floorImage, in: bounds)
+        } else {
+            drawBackground(ctx)
+        }
         for j in 0..<rows {
             let cy = originY + CGFloat(j) * pitch
             let rowBase = j * cols
@@ -309,7 +721,7 @@ public final class UltracodeLifeView: ScreenSaverView {
                     drawCell(ctx, x: cx, y: cy,
                              color: trailColors[min(-s, trailLength) - 1],
                              bloom: false)
-                } else {
+                } else if floorImage == nil {
                     drawCell(ctx, x: cx, y: cy, color: floorColor, bloom: false)
                 }
             }

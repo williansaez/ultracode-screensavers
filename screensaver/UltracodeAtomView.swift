@@ -117,6 +117,12 @@ public final class UltracodeAtomView: ScreenSaverView {
     private var electronColor: NSColor = .white
     private let trailLevels = 64
 
+    /// Pre-rendered empty lattice (bg gradient + every cell at the floor
+    /// brightness), blitted as the first drawing step each frame instead of
+    /// filling thousands of floor cells individually.
+    private var floorImage: CGImage?
+    private var floorImageSize = NSSize.zero
+
     // MARK: - Atom simulation (Rutherford rosette, lattice-aligned)
 
     // Modeled on the classic Rutherford atom illustration: a NUCLEUS CLUSTER
@@ -254,6 +260,57 @@ public final class UltracodeAtomView: ScreenSaverView {
         frameCount = 0
         rosettePrec = 0
         framesToNextArrival = Int(config.fps * 5.0)   // 2nd e- after 5 s
+
+        rebuildFloorImage()
+    }
+
+    /// Renders the whole empty lattice once (Retina scale) so draw() can
+    /// blit it instead of filling ~cols*rows floor cells per frame. Rebuilt
+    /// by rebuildGrid() on resize/config change, so the floor slider works.
+    private func rebuildFloorImage() {
+        floorImage = nil
+        floorImageSize = bounds.size
+        let scale = window?.backingScaleFactor ?? 2
+        let pw = max(1, Int(bounds.width * scale))
+        let ph = max(1, Int(bounds.height * scale))
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let ctx = CGContext(data: nil, width: pw, height: ph,
+                                  bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: space,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return }
+        ctx.scaleBy(x: scale, y: scale)
+
+        // Same gradient as drawBackground().
+        let colors = [bgTop.color.cgColor, bgBottom.color.cgColor] as CFArray
+        if let grad = CGGradient(colorsSpace: space, colors: colors, locations: [0, 1]) {
+            ctx.drawLinearGradient(grad,
+                                   start: CGPoint(x: 0, y: bounds.height),
+                                   end: CGPoint(x: 0, y: 0),
+                                   options: [])
+        } else {
+            ctx.setFillColor(bgTop.color.cgColor)
+            ctx.fill(CGRect(x: 0, y: 0, width: bounds.width, height: bounds.height))
+        }
+
+        // Every cell at the floor brightness, in one batched fill.
+        let radius = cellSide * 0.28
+        let path = CGMutablePath()
+        for j in 0..<rows {
+            let cy = originY + CGFloat(j) * pitch
+            for i in 0..<cols {
+                let cx = originX + CGFloat(i) * pitch
+                let rect = CGRect(x: cx - cellSide / 2, y: cy - cellSide / 2,
+                                  width: cellSide, height: cellSide)
+                path.addPath(CGPath(roundedRect: rect, cornerWidth: radius,
+                                    cornerHeight: radius, transform: nil))
+            }
+        }
+        ctx.setFillColor(floorColor.cgColor)
+        ctx.addPath(path)
+        ctx.fillPath()
+
+        floorImage = ctx.makeImage()
     }
 
     /// Proton packing order: lattice offsets sorted center-out, so the
@@ -400,22 +457,43 @@ public final class UltracodeAtomView: ScreenSaverView {
 
     public override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
-        if trail.isEmpty { rebuildGrid() }
+        if trail.isEmpty || floorImage == nil || floorImageSize != bounds.size {
+            rebuildGrid()
+        }
 
-        drawBackground(ctx)
+        // Floor blit: bg gradient + every cell at floor brightness, prebuilt.
+        if let floorImage {
+            ctx.draw(floorImage, in: bounds)
+        } else {
+            drawBackground(ctx)
+        }
 
-        // Lattice: floor + comet trails (no visible orbit paths).
+        // Comet trails above the floor blit, batched: ONE fill per quantized
+        // level instead of one path per cell. Floor-level cells are skipped
+        // (the blit already shows them).
+        let radius = cellSide * 0.28
+        var levelPaths = [CGMutablePath?](repeating: nil, count: trailLevels)
         for j in 0..<rows {
             let cy = originY + CGFloat(j) * pitch
             let rowBase = j * cols
             for i in 0..<cols {
                 let v = trail[rowBase + i]
                 let lvl = min(trailLevels - 1, max(0, Int(CGFloat(v) * CGFloat(trailLevels - 1))))
+                if lvl <= 1 { continue }            // floor: already blitted
                 let cx = originX + CGFloat(i) * pitch
-                drawCell(ctx, x: cx, y: cy,
-                         color: lvl <= 1 ? floorColor : trailColors[lvl],
-                         bloom: false)
+                let rect = CGRect(x: cx - cellSide / 2, y: cy - cellSide / 2,
+                                  width: cellSide, height: cellSide)
+                let p = levelPaths[lvl] ?? CGMutablePath()
+                p.addPath(CGPath(roundedRect: rect, cornerWidth: radius,
+                                 cornerHeight: radius, transform: nil))
+                levelPaths[lvl] = p
             }
+        }
+        for lvl in 2..<trailLevels {
+            guard let p = levelPaths[lvl] else { continue }
+            ctx.setFillColor(trailColors[lvl].cgColor)
+            ctx.addPath(p)
+            ctx.fillPath()
         }
 
         // Nucleus cluster: protons only, all in the contrast accent, with a

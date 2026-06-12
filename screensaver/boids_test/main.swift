@@ -35,6 +35,38 @@ guard let view = UltracodeBoidsView(frame: NSRect(origin: .zero, size: size),
     fatalError("failed to create view")
 }
 
+// Perf harness (env-gated, BOIDS_PERF=1): pitch comes from the saver's
+// prefs (write it via `defaults -currentHost write` before running).
+// Pumps animateOneFrame + offscreen draw(bounds) 60x, prints avg ms/frame.
+if ProcessInfo.processInfo.environment["BOIDS_PERF"] == "1" {
+    let b = view.bounds
+    guard let rep = NSBitmapImageRep(
+        bitmapDataPlanes: nil,
+        pixelsWide: Int(b.width), pixelsHigh: Int(b.height),
+        bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+        colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+    ), let gctx = NSGraphicsContext(bitmapImageRep: rep) else {
+        fatalError("failed to create perf bitmap context")
+    }
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = gctx
+    for _ in 0..<10 {            // warm-up: grid + floor image build
+        view.animateOneFrame()
+        view.draw(b)
+    }
+    let t0 = CFAbsoluteTimeGetCurrent()
+    let frames = 60
+    for _ in 0..<frames {
+        view.animateOneFrame()
+        view.draw(b)
+    }
+    let elapsed = CFAbsoluteTimeGetCurrent() - t0
+    NSGraphicsContext.restoreGraphicsState()
+    print(String(format: "perf: %.2f ms/frame (sim+draw, %d frames)",
+                 elapsed / Double(frames) * 1000, frames))
+    exit(0)
+}
+
 // Early: flock leaving the seed clusters.
 for _ in 0..<5 { view.animateOneFrame() }
 snapshot(view, to: "\(outDir)/boids_t5.png")

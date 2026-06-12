@@ -137,10 +137,17 @@ public final class UltracodeLightningView: ScreenSaverView {
 
     /// Precomputed colors: trail intensity LUT, hot flash color, grid floor.
     private var cellColors: [NSColor] = []
+    private var cellCGColors: [CGColor] = []
     private var hotColor: NSColor = .white
     private var floorColor: NSColor = .black
     private var liftTopColor: NSColor = .black
     private var liftBottomColor: NSColor = .black
+
+    /// Pre-rendered empty lattice (bg gradient + every cell at floor color),
+    /// blitted each frame instead of filling thousands of floor cells.
+    /// `floorLiftImage` is the flash-frame variant with the lifted gradient.
+    private var floorImage: CGImage?
+    private var floorLiftImage: CGImage?
 
     private var rngState: UInt64 = 0x243F6A8885A308D3
     private func nextRand() -> UInt64 {
@@ -211,7 +218,58 @@ public final class UltracodeLightningView: ScreenSaverView {
         liftTopColor = RGB.lerp(bgTop, tint, 0.16).color
         liftBottomColor = RGB.lerp(bgBottom, tint, 0.16).color
 
+        cellCGColors = cellColors.map(\.cgColor)
+        floorImage = makeFloorImage(top: bgTop.color, bottom: bgBottom.color)
+        floorLiftImage = makeFloorImage(top: liftTopColor, bottom: liftBottomColor)
+
         reseed()
+    }
+
+    /// Renders the whole empty lattice once (Retina scale) so draw() can blit
+    /// it instead of filling ~cols*rows floor cells every frame.
+    private func makeFloorImage(top: NSColor, bottom: NSColor) -> CGImage? {
+        let w = bounds.width, h = bounds.height
+        guard w >= 1, h >= 1 else { return nil }
+        let scale = window?.backingScaleFactor ?? 2
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let ctx = CGContext(
+                  data: nil,
+                  width: Int(w * scale), height: Int(h * scale),
+                  bitsPerComponent: 8, bytesPerRow: 0, space: space,
+                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return nil }
+        ctx.scaleBy(x: scale, y: scale)
+
+        // Background gradient, same geometry as drawBackground().
+        let colors = [top.cgColor, bottom.cgColor] as CFArray
+        if let grad = CGGradient(colorsSpace: space, colors: colors,
+                                 locations: [0, 1]) {
+            ctx.drawLinearGradient(grad,
+                                   start: CGPoint(x: 0, y: h),
+                                   end: CGPoint(x: 0, y: 0),
+                                   options: [])
+        } else {
+            ctx.setFillColor(top.cgColor)
+            ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+        }
+
+        // Every cell at the floor color, one batched fill.
+        let radius = cellSide * 0.28
+        let path = CGMutablePath()
+        for j in 0..<rows {
+            let cy = originY + CGFloat(j) * pitch
+            for i in 0..<cols {
+                let cx = originX + CGFloat(i) * pitch
+                let rect = CGRect(x: cx - cellSide / 2, y: cy - cellSide / 2,
+                                  width: cellSide, height: cellSide)
+                path.addPath(CGPath(roundedRect: rect, cornerWidth: radius,
+                                    cornerHeight: radius, transform: nil))
+            }
+        }
+        ctx.setFillColor(floorColor.cgColor)
+        ctx.addPath(path)
+        ctx.fillPath()
+        return ctx.makeImage()
     }
 
     private func reseed() {
@@ -375,23 +433,42 @@ public final class UltracodeLightningView: ScreenSaverView {
 
     public override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
-        if trail.isEmpty { rebuildGrid() }
+        if trail.isEmpty || floorImage == nil { rebuildGrid() }
 
-        drawBackground(ctx)
+        // Floor blit: bg gradient + every cell at floor color, pre-rendered.
+        if let floor = bgLift > 0 ? floorLiftImage : floorImage {
+            ctx.draw(floor, in: bounds)
+        } else {
+            drawBackground(ctx)   // degenerate size; image unavailable
+        }
 
+        // Dynamic cells batched by quantized intensity level: one path + one
+        // fill per level instead of one fill per cell. Cells at the floor
+        // level (v == 0, or quantized to it) are already in the blit.
+        var levelPaths = [CGMutablePath?](repeating: nil, count: 32)
+        let radius = cellSide * 0.28
         for j in 0..<rows {
             let cy = originY + CGFloat(j) * pitch
             let rowBase = j * cols
             for i in 0..<cols {
                 let v = trail[rowBase + i]
+                guard v > 0 else { continue }
+                let k = min(31, Int(v * 31 + 0.5))
+                guard k > 0 else { continue }
                 let cx = originX + CGFloat(i) * pitch
-                if v <= 0 {
-                    drawCell(ctx, x: cx, y: cy, color: floorColor, bloom: false)
-                } else {
-                    let k = min(31, Int(v * 31 + 0.5))
-                    drawCell(ctx, x: cx, y: cy, color: cellColors[k], bloom: false)
-                }
+                let rect = CGRect(x: cx - cellSide / 2, y: cy - cellSide / 2,
+                                  width: cellSide, height: cellSide)
+                let path = levelPaths[k] ?? CGMutablePath()
+                path.addPath(CGPath(roundedRect: rect, cornerWidth: radius,
+                                    cornerHeight: radius, transform: nil))
+                levelPaths[k] = path
             }
+        }
+        for k in 1..<32 {
+            guard let path = levelPaths[k] else { continue }
+            ctx.setFillColor(cellCGColors[k])
+            ctx.addPath(path)
+            ctx.fillPath()
         }
 
         // Bloom pass: only the flash frames' capped main-channel cells.

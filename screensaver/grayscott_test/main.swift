@@ -31,6 +31,50 @@ func snapshot(_ view: NSView, to path: String) {
     print("wrote \(path)")
 }
 
+// Perf mode (GS_PERF=1): time sim+draw per frame. Set the pitch pref first
+// (defaults -currentHost write com.williansaez.ultracode-grayscott pitch ...).
+if ProcessInfo.processInfo.environment["GS_PERF"] != nil {
+    guard let pv = UltracodeGrayScottView(frame: NSRect(origin: .zero, size: size),
+                                          isPreview: false) else {
+        fatalError("failed to create view")
+    }
+    guard let rep = NSBitmapImageRep(
+        bitmapDataPlanes: nil,
+        pixelsWide: Int(size.width), pixelsHigh: Int(size.height),
+        bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+        colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+    ), let gctx = NSGraphicsContext(bitmapImageRep: rep) else {
+        fatalError("failed to create bitmap context")
+    }
+    // Warm-up: let the pattern grow so the draw load is representative.
+    for _ in 0..<120 { pv.animateOneFrame() }
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = gctx
+    pv.draw(pv.bounds)   // warm caches / floor image
+    let frames = 60
+    var simNs: UInt64 = 0
+    var drawNs: UInt64 = 0
+    let t0 = DispatchTime.now().uptimeNanoseconds
+    for _ in 0..<frames {
+        let a = DispatchTime.now().uptimeNanoseconds
+        pv.animateOneFrame()
+        let b = DispatchTime.now().uptimeNanoseconds
+        pv.draw(pv.bounds)
+        let c = DispatchTime.now().uptimeNanoseconds
+        simNs += b - a
+        drawNs += c - b
+    }
+    let t1 = DispatchTime.now().uptimeNanoseconds
+    NSGraphicsContext.restoreGraphicsState()
+    let ms = Double(t1 - t0) / 1_000_000.0 / Double(frames)
+    pv.debugDump()
+    print(String(format: "perf: %d frames, avg sim+draw = %.2f ms/frame (sim %.2f, draw %.2f)",
+                 frames, ms,
+                 Double(simNs) / 1_000_000.0 / Double(frames),
+                 Double(drawNs) / 1_000_000.0 / Double(frames)))
+    exit(0)
+}
+
 guard let view = UltracodeGrayScottView(frame: NSRect(origin: .zero, size: size),
                                         isPreview: false) else {
     fatalError("failed to create view")

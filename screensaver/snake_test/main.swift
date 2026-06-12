@@ -30,6 +30,41 @@ func snapshot(_ view: NSView, to path: String) {
     print("wrote \(path)")
 }
 
+// Perf mode (SNAKE_PERF=1): set the pitch pref to 8 beforehand
+// (defaults -currentHost write com.williansaez.ultracode-snake pitch -float 8),
+// then time 60 frames of sim + offscreen draw and print the average.
+if ProcessInfo.processInfo.environment["SNAKE_PERF"] != nil {
+    guard let v = UltracodeSnakeView(frame: NSRect(origin: .zero, size: size),
+                                     isPreview: false) else {
+        fatalError("failed to create view")
+    }
+    for _ in 0..<10 { v.animateOneFrame() }   // warm-up: grid + floor image
+    let b = v.bounds
+    guard let rep = NSBitmapImageRep(
+        bitmapDataPlanes: nil,
+        pixelsWide: Int(b.width), pixelsHigh: Int(b.height),
+        bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+        colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+    ), let gctx = NSGraphicsContext(bitmapImageRep: rep) else {
+        fatalError("failed to create bitmap context")
+    }
+    let frames = 60
+    let t0 = DispatchTime.now().uptimeNanoseconds
+    for _ in 0..<frames {
+        v.animateOneFrame()
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = gctx
+        v.draw(b)
+        gctx.flushGraphics()
+        NSGraphicsContext.restoreGraphicsState()
+    }
+    let t1 = DispatchTime.now().uptimeNanoseconds
+    let ms = Double(t1 - t0) / 1_000_000.0 / Double(frames)
+    print(String(format: "perf: %.2f ms/frame (sim+draw, %d frames, %dx%d)",
+                 ms, frames, Int(b.width), Int(b.height)))
+    exit(0)
+}
+
 guard let view = UltracodeSnakeView(frame: NSRect(origin: .zero, size: size),
                                     isPreview: false) else {
     fatalError("failed to create view")

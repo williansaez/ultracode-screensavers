@@ -65,12 +65,39 @@ if let view = UltracodeView(frame: NSRect(origin: .zero, size: size), isPreview:
     print("configureSheet:", view.configureSheet != nil ? "built OK" : "FAILED")
 }
 
-// Freeze-frame pipeline test: stopAnimation must persist lastframe.png.
-if let view = UltracodeView(frame: NSRect(origin: .zero, size: size), isPreview: false) {
-    view.startAnimation()
-    for _ in 0..<200 { view.animateOneFrame() }
-    view.stopAnimation()
-    let p = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        .appendingPathComponent("Ultracode/lastframe.png").path
-    print("freeze file:", FileManager.default.fileExists(atPath: p) ? "OK \(p)" : "MISSING \(p)")
+// Perf harness (gated): ULTRACODE_PERF=1 ./render_test
+// Worst-case grid (pitch 8 -> ~190x124 cells), 60 frames of sim + draw
+// into a Retina-scale bitmap, average ms/frame printed. The pitch
+// override is removed afterwards.
+if ProcessInfo.processInfo.environment["ULTRACODE_PERF"] == "1" {
+    defaults.set(8.0, forKey: "pitch")
+    defaults.synchronize()
+    if let view = UltracodeView(frame: NSRect(origin: .zero, size: size),
+                                isPreview: false) {
+        for _ in 0..<120 { view.animateOneFrame() }   // warm up the flames
+        let scale: CGFloat = 2
+        guard let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: Int(size.width * scale), pixelsHigh: Int(size.height * scale),
+            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+        ), let gctx = NSGraphicsContext(bitmapImageRep: rep) else {
+            fatalError("perf: failed to create bitmap context")
+        }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = gctx
+        gctx.cgContext.scaleBy(x: scale, y: scale)
+        let frames = 60
+        let t0 = CFAbsoluteTimeGetCurrent()
+        for _ in 0..<frames {
+            view.animateOneFrame()
+            view.draw(view.bounds)
+        }
+        let elapsed = CFAbsoluteTimeGetCurrent() - t0
+        NSGraphicsContext.restoreGraphicsState()
+        print(String(format: "perf: %.2f ms/frame (sim+draw, pitch 8, %d frames)",
+                     elapsed / Double(frames) * 1000, frames))
+    }
+    defaults.removeObject(forKey: "pitch")
+    defaults.synchronize()
 }
