@@ -388,6 +388,38 @@ public final class UltracodeAtomView: ScreenSaverView {
         electrons.append(e)
     }
 
+    // MARK: - Exclusion force (nucleus must never reach the orbit zone)
+
+    /// Cluster radius for a given proton count (outermost packed slot).
+    private func nucleusRadius(_ count: Int) -> Float {
+        guard count > 0 else { return 0 }
+        ensureProtonCapacity(count)
+        let (dx, dy) = protonOrder[count - 1]
+        return sqrt(Float(dx * dx + dy * dy)) + 0.5
+    }
+
+    /// Closest approach of the tightest possible orbit (b varies 0.92-1.08).
+    private var minOrbitClearance: Float { orbitB * 0.85 }
+    private let nucleusGap: Float = 1.5    // cells of forced clearance
+
+    /// The exclusion force fired: the innermost settled electron is repelled
+    /// radially out of the atom and takes its proton with it (1:1), shrinking
+    /// the nucleus back below the orbit zone — the equilibrium point.
+    private func repelInnermost() {
+        guard protonCount > 1,
+              let idx = electrons.indices
+                .filter({ electrons[$0].inFrames == 0 && electrons[$0].outFrames == 0 })
+                .min(by: { electrons[$0].b < electrons[$1].b }) else { return }
+        var e = electrons[idx]
+        let x = e.lastX, y = e.lastY
+        let len = max(1e-3, sqrt(x * x + y * y))
+        e.outFrames = 1
+        e.ox = x / len * 0.45              // shove straight away from the nucleus
+        e.oy = y / len * 0.45
+        electrons[idx] = e
+        protonCount = max(1, protonCount - 1)
+    }
+
     // MARK: - Frame
 
     public override func animateOneFrame() {
@@ -399,6 +431,13 @@ public final class UltracodeAtomView: ScreenSaverView {
         if framesToNextArrival <= 0 {
             spawnIncoming()
             framesToNextArrival = Int(config.fps * (6.0 + 6.0 * Double(randF())))
+        }
+
+        // Exclusion check: if the proton cluster has grown to within the
+        // forced gap of the innermost orbit (easy on small views), repel one
+        // electron per frame until nucleus and orbits no longer collide.
+        if nucleusRadius(protonCount) + nucleusGap >= minOrbitClearance {
+            repelInnermost()
         }
 
         for i in 0..<trail.count { trail[i] *= trailDecay }
