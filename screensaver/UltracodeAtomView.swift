@@ -160,7 +160,6 @@ public final class UltracodeAtomView: ScreenSaverView {
     private var orbitA: Float = 14
     private var orbitB: Float = 6
 
-    private let maxElectrons = 10
     private var framesToNextArrival = 0
     private var frameCount = 0
 
@@ -243,7 +242,8 @@ public final class UltracodeAtomView: ScreenSaverView {
         orbitA = short * 0.42
         orbitB = short * 0.17
 
-        buildProtonOrder(capacity: maxElectrons)
+        protonRadius = 3
+        buildProtonOrder()
         protonCount = 1                          // hydrogen: 1 p+ for 1 e-
 
         trail = .init(repeating: 0, count: cols * rows)
@@ -258,9 +258,13 @@ public final class UltracodeAtomView: ScreenSaverView {
 
     /// Proton packing order: lattice offsets sorted center-out, so the
     /// cluster grows compactly as electrons (and their protons) arrive.
-    private func buildProtonOrder(capacity: Int) {
+    /// Rebuilt with a larger radius whenever the cluster outgrows it —
+    /// there is no ceiling.
+    private var protonRadius = 3
+
+    private func buildProtonOrder() {
         var offs: [(Int, Int)] = []
-        let ri = 3
+        let ri = protonRadius
         for dy in -ri...ri {
             for dx in -ri...ri {
                 offs.append((dx, dy))
@@ -273,15 +277,23 @@ public final class UltracodeAtomView: ScreenSaverView {
             // Stable angular tiebreak inside each shell.
             return atan2(Float($0.1), Float($0.0)) < atan2(Float($1.1), Float($1.0))
         }
-        protonOrder = Array(offs.prefix(capacity))
+        protonOrder = offs
+    }
+
+    private func ensureProtonCapacity(_ n: Int) {
+        while protonOrder.count < n {
+            protonRadius += 2
+            buildProtonOrder()
+        }
     }
 
     private func makeOrbitElements(slot: Int) -> Electron {
-        // Rosette tilt: evenly distributed petals.
-        let tilt = Float(slot) * .pi / Float(maxElectrons)
+        // Rosette tilt: golden-angle spacing stays evenly spread no matter
+        // how many electrons accumulate (there is no cap).
+        let tilt = Float(slot) * 2.39996323
         let a = orbitA * (0.96 + randF() * 0.08)
         let b = orbitB * (0.92 + randF() * 0.16)
-        let speed: Float = 0.022 * (0.9 + randF() * 0.2)
+        let speed: Float = 0.044 * (0.9 + randF() * 0.2)
         return Electron(
             a: a, b: b, w: speed,
             phase: randF() * 2 * .pi,
@@ -319,26 +331,6 @@ public final class UltracodeAtomView: ScreenSaverView {
         electrons.append(e)
     }
 
-    private func ejectOutermost() {
-        guard let idx = electrons.indices
-            .filter({ electrons[$0].inFrames == 0 && electrons[$0].outFrames == 0 })
-            .max(by: { electrons[$0].a < electrons[$1].a }) else { return }
-        var e = electrons[idx]
-        let (x0, y0) = orbitPos(e)
-        var ee = e
-        ee.phase += e.w * 2
-        let (x1, y1) = orbitPos(ee)
-        var dx = x1 - x0, dy = y1 - y0
-        let len = max(1e-4, sqrt(dx * dx + dy * dy))
-        dx /= len; dy /= len
-        e.outFrames = 1
-        e.ox = dx * 0.35; e.oy = dy * 0.35
-        e.lastX = x0; e.lastY = y0
-        electrons[idx] = e
-        // The matching proton leaves with it (1:1).
-        protonCount = max(1, protonCount - 1)
-    }
-
     // MARK: - Frame
 
     public override func animateOneFrame() {
@@ -348,14 +340,8 @@ public final class UltracodeAtomView: ScreenSaverView {
 
         framesToNextArrival -= 1
         if framesToNextArrival <= 0 {
-            let active = electrons.filter { $0.outFrames == 0 }.count
-            if active >= maxElectrons {
-                ejectOutermost()
-                framesToNextArrival = Int(config.fps * (3.0 + 3.0 * Double(randF())))
-            } else {
-                spawnIncoming()
-                framesToNextArrival = Int(config.fps * (6.0 + 6.0 * Double(randF())))
-            }
+            spawnIncoming()
+            framesToNextArrival = Int(config.fps * (6.0 + 6.0 * Double(randF())))
         }
 
         for i in 0..<trail.count { trail[i] *= trailDecay }
@@ -384,7 +370,8 @@ public final class UltracodeAtomView: ScreenSaverView {
                 e.ringAlpha = min(1, u + 0.1)              // ring fades in
                 if e.inFrames == 0 {
                     // Captured: the nucleus gains its matching proton (1:1).
-                    protonCount = min(protonOrder.count, protonCount + 1)
+                    protonCount += 1
+                    ensureProtonCapacity(protonCount)
                 }
             } else {
                 e.phase += e.w
