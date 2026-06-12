@@ -18,3 +18,11 @@ live/
 screensaver/*.saver/Contents/_CodeSignature/
 screensaver/*_test/clocktest
 screensaver/*_test/*_check
+# Qualquer binário Mach-O de harness (nomes variados)
+screensaver/*_test/verify_floor
+screensaver/*_test/*_bin
+screensaver/*_test/*_harness
+screensaver/*_test/maze_test
+screensaver/*_test/lightning_test
+screensaver/*_test/pong_test
+screensaver/*_test/floor_verify/
