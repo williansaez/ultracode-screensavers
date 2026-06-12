@@ -1,0 +1,18 @@
+.DS_Store
+
+# Binários compilados (recompilar com screensaver/build.sh)
+screensaver/*.saver/Contents/MacOS/
+screensaver/render_test
+screensaver/*_test/render_*
+screensaver/*_test/flicker_check
+
+# PNGs de verificação dos harnesses (os curados vivem em screenshots/)
+screensaver/*.png
+screensaver/*_test/*.png
+
+# Artefactos de runtime do wallpaper congelado
+live/
+
+# Local/gerado
+.claude/
+screensaver/*.saver/Contents/_CodeSignature/

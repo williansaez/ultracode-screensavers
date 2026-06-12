@@ -1,0 +1,598 @@
+import AppKit
+import ScreenSaver
+
+private extension Notification.Name {
+    static let lightningConfigChanged = Notification.Name("UltracodeLightningConfigChanged")
+}
+
+@objc(UltracodeLightningView)
+public final class UltracodeLightningView: ScreenSaverView {
+
+    // MARK: - Color helpers
+
+    private struct RGB {
+        var r: CGFloat, g: CGFloat, b: CGFloat
+        init(_ hex: UInt32) {
+            r = CGFloat((hex >> 16) & 0xFF) / 255
+            g = CGFloat((hex >> 8) & 0xFF) / 255
+            b = CGFloat(hex & 0xFF) / 255
+        }
+        init(r: CGFloat, g: CGFloat, b: CGFloat) {
+            self.r = r; self.g = g; self.b = b
+        }
+        static func lerp(_ a: RGB, _ b: RGB, _ t: CGFloat) -> RGB {
+            RGB(r: a.r + (b.r - a.r) * t,
+                g: a.g + (b.g - a.g) * t,
+                b: a.b + (b.b - a.b) * t)
+        }
+        var color: NSColor { NSColor(srgbRed: r, green: g, blue: b, alpha: 1) }
+    }
+
+    private struct Theme {
+        let name: String
+        let stops: [UInt32]   // cold -> hot
+    }
+
+    private static let themes: [Theme] = [
+        Theme(name: "Ultracode (lavanda)", stops: [
+            0x34313A, 0x3D3946, 0x56506B, 0x6F6590,
+            0x9C8FD0, 0xB9AEE8, 0xCFC6F2, 0xEEE9FB,
+        ]),
+        Theme(name: "Doom clássico", stops: [
+            0x3A322C, 0x571B08, 0x9F2A00, 0xD75F07,
+            0xF0A039, 0xFAD75C, 0xFFF3A0, 0xFFFFE6,
+        ]),
+        Theme(name: "Matrix", stops: [
+            0x303A33, 0x2F4D33, 0x2F6B3A, 0x32934A,
+            0x3FBF5F, 0x73E08C, 0xB6F2C2, 0xEFFFF2,
+        ]),
+    ]
+
+    private let bgTop = RGB(0x232126)
+    private let bgBottom = RGB(0x1B191E)
+
+    private func ramp(_ v: CGFloat, stops: [RGB]) -> RGB {
+        let x = min(max(v, 0), 1) * CGFloat(stops.count - 1)
+        let i = min(Int(x), stops.count - 2)
+        return RGB.lerp(stops[i], stops[i + 1], x - CGFloat(i))
+    }
+
+    // MARK: - User configuration
+
+    private struct Config {
+        var theme = 0
+        var pitch: Double = 26    // points between cell centers
+        var fps: Double = 30      // frames per second
+        var floor: Double = 0.10  // empty-cell brightness on the theme ramp
+        var bloom = true
+    }
+
+    private static let moduleName = "com.williansaez.ultracode-lightning"
+
+    private static func makeDefaults() -> ScreenSaverDefaults? {
+        let d = ScreenSaverDefaults(forModuleWithName: moduleName)
+        d?.register(defaults: [
+            "theme": 0,
+            "pitch": 26.0,
+            "fps": 30.0,
+            "floorLevel": 0.10,
+            "bloom": true,
+        ])
+        return d
+    }
+
+    private var config = Config()
+
+    private func loadConfig() {
+        guard let d = Self.makeDefaults() else { return }
+        config.theme = min(max(d.integer(forKey: "theme"), 0), Self.themes.count - 1)
+        config.pitch = min(max(d.double(forKey: "pitch"), 8.0), 80.0)
+        config.fps = min(max(d.double(forKey: "fps"), 15.0), 60.0)
+        config.floor = min(max(d.double(forKey: "floorLevel"), 0.0), 0.30)
+        config.bloom = d.bool(forKey: "bloom")
+        animationTimeInterval = 1.0 / config.fps
+    }
+
+    // MARK: - Grid + lightning state
+
+    private var cols = 0
+    private var rows = 0
+    private var pitch: CGFloat = 26
+    private var cellSide: CGFloat = 18
+    private var originX: CGFloat = 0
+    private var originY: CGFloat = 0
+
+    /// Per-cell glow intensity 0...1, decaying every frame (the bolt trail).
+    private var trail: [CGFloat] = []
+    private let trailDecay: CGFloat = 0.88
+
+    /// One stepped leader tip. Row 0 is the bottom of the (overflow) grid,
+    /// so growing "downward" means y decreasing toward 0.
+    private struct Leader {
+        var x: Int
+        var y: Int
+        var depth: Int        // 0 = main channel, branches up to depth 2
+        var bias: Int         // preferred dx, keeps the walk's general drift
+        var stepsLeft: Int    // branch lifetime; ignored for the main leader
+        var alive: Bool = true
+    }
+
+    private struct Bolt {
+        var leaders: [Leader] = []
+        var mainPath: [Int] = []     // cell indices of the main channel, in order
+        var branchPath: [Int] = []
+        var flashing = false
+        var flashLeft = 0
+        var done = false
+    }
+
+    private var bolts: [Bolt] = []
+    private var bloomCells: [Int] = []     // flash-frame bloom (every 3rd main cell)
+    private var bgLift: CGFloat = 0        // faint ambient lift during flash frames
+    private var spawnCountdown = 0         // dark-pause frames until the next bolt
+    private var secondCountdown = -1      // optional overlapping second bolt
+
+    private let dimByDepth: [CGFloat] = [0.40, 0.30, 0.24]
+    private let maxLeadersPerBolt = 12
+
+    /// Precomputed colors: trail intensity LUT, hot flash color, grid floor.
+    private var cellColors: [NSColor] = []
+    private var hotColor: NSColor = .white
+    private var floorColor: NSColor = .black
+    private var liftTopColor: NSColor = .black
+    private var liftBottomColor: NSColor = .black
+
+    private var rngState: UInt64 = 0x243F6A8885A308D3
+    private func nextRand() -> UInt64 {
+        rngState ^= rngState << 13
+        rngState ^= rngState >> 7
+        rngState ^= rngState << 17
+        return rngState
+    }
+    private func rand01() -> Double { Double(nextRand() % 10000) / 10000.0 }
+
+    /// Toroidal wrap that survives negative values.
+    private func wrap(_ i: Int, _ n: Int) -> Int {
+        let m = i % n
+        return m < 0 ? m + n : m
+    }
+
+    // MARK: - Init
+
+    public override init?(frame: NSRect, isPreview: Bool) {
+        super.init(frame: frame, isPreview: isPreview)
+        commonInit()
+    }
+
+    public required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        commonInit()
+    }
+
+    private func commonInit() {
+        wantsLayer = true
+        loadConfig()
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(configChanged),
+            name: .lightningConfigChanged, object: nil)
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+
+    @objc private func configChanged() {
+        loadConfig()
+        rebuildGrid()
+        needsDisplay = true
+    }
+
+    // MARK: - Layout
+
+    private func rebuildGrid() {
+        pitch = isPreview ? 9 : CGFloat(config.pitch)
+        cellSide = pitch * 0.70
+        cols = max(8, Int(bounds.width / pitch) + 2)
+        rows = max(8, Int(bounds.height / pitch) + 2)
+        originX = (bounds.width - CGFloat(cols - 1) * pitch) / 2
+        originY = (bounds.height - CGFloat(rows - 1) * pitch) / 2
+
+        let stops = Self.themes[config.theme].stops.map(RGB.init)
+        let f = CGFloat(config.floor)
+        floorColor = ramp(f, stops: stops).color
+        hotColor = ramp(1.0, stops: stops).color
+        // Intensity LUT: trail value 0...1 -> floor-to-hot ramp.
+        cellColors = (0...31).map { k in
+            let v = CGFloat(k) / 31.0
+            return ramp(f + (1 - f) * v, stops: stops).color
+        }
+        // Flash frames briefly lift the backdrop toward the theme's glow.
+        let tint = ramp(0.55, stops: stops)
+        liftTopColor = RGB.lerp(bgTop, tint, 0.16).color
+        liftBottomColor = RGB.lerp(bgBottom, tint, 0.16).color
+
+        reseed()
+    }
+
+    private func reseed() {
+        trail = .init(repeating: 0, count: cols * rows)
+        bolts.removeAll()
+        bloomCells.removeAll()
+        bgLift = 0
+        spawnCountdown = max(4, Int(config.fps * 0.6))   // first bolt soon
+        secondCountdown = -1
+    }
+
+    public override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        rebuildGrid()
+    }
+
+    public override func startAnimation() {
+        loadConfig()
+        super.startAnimation()
+        rebuildGrid()
+    }
+
+    // MARK: - Lightning step
+
+    private func spawnBolt() {
+        var bolt = Bolt()
+        let startX = Int(nextRand() % UInt64(max(1, cols)))
+        bolt.leaders.append(Leader(x: startX, y: rows - 1, depth: 0,
+                                   bias: nextRand() % 2 == 0 ? -1 : 1,
+                                   stepsLeft: Int.max))
+        let idx = (rows - 1) * cols + startX
+        bolt.mainPath.append(idx)
+        bolts.append(bolt)
+    }
+
+    private func growBolt(_ b: Int) {
+        let steps = 2 + Int(nextRand() % 3)    // extend 2-4 segments per frame
+        for li in bolts[b].leaders.indices {
+            guard bolts[b].leaders[li].alive else { continue }
+            var L = bolts[b].leaders[li]
+            inner: for _ in 0..<steps {
+                // Down-biased random walk: dy = -1 (toward the bottom),
+                // dx weighted to keep the leader's general drift.
+                let r = nextRand() % 100
+                let dx: Int
+                if r < 45 { dx = L.bias }
+                else if r < 80 { dx = 0 }
+                else { dx = -L.bias }
+                L.x = wrap(L.x + dx, cols)
+                L.y -= 1
+                if L.y < 0 {
+                    if L.depth == 0 {
+                        // Main leader hit the bottom: FLASH.
+                        bolts[b].flashing = true
+                        bolts[b].flashLeft = 3 + Int(nextRand() % 2)
+                    }
+                    L.alive = false
+                    break inner
+                }
+                let idx = L.y * cols + L.x
+                if L.depth == 0 { bolts[b].mainPath.append(idx) }
+                else { bolts[b].branchPath.append(idx) }
+                trail[idx] = max(trail[idx], dimByDepth[min(L.depth, 2)])
+
+                // ~12% chance to fork a branch (shorter, dimmer, max depth 2).
+                let forkChance: UInt64 = L.depth == 0 ? 12 : (L.depth == 1 ? 8 : 0)
+                if forkChance > 0, nextRand() % 100 < forkChance,
+                   bolts[b].leaders.count < maxLeadersPerBolt {
+                    let len = L.depth == 0
+                        ? 4 + Int(nextRand() % UInt64(max(4, rows / 4)))
+                        : 3 + Int(nextRand() % 5)
+                    bolts[b].leaders.append(
+                        Leader(x: L.x, y: L.y, depth: L.depth + 1,
+                               bias: nextRand() % 2 == 0 ? -1 : 1,
+                               stepsLeft: len))
+                }
+                if L.depth > 0 {
+                    L.stepsLeft -= 1
+                    if L.stepsLeft <= 0 { L.alive = false; break inner }
+                }
+            }
+            bolts[b].leaders[li] = L
+            if bolts[b].flashing { break }
+        }
+        // Keep the whole channel at its dim level while the leader grows
+        // (the decaying trail would otherwise erode the upper segments).
+        if !bolts[b].flashing {
+            for idx in bolts[b].mainPath { trail[idx] = max(trail[idx], dimByDepth[0]) }
+            for idx in bolts[b].branchPath { trail[idx] = max(trail[idx], dimByDepth[1]) }
+        }
+    }
+
+    private func stepLightning() {
+        guard cols > 2, rows > 2 else { return }
+
+        // Decay the trail grid (~1.5 s fade-out after a flash).
+        for i in 0..<trail.count where trail[i] > 0 {
+            trail[i] *= trailDecay
+            if trail[i] < 0.025 { trail[i] = 0 }
+        }
+        bloomCells.removeAll(keepingCapacity: true)
+        bgLift = 0
+
+        // Dark pause between bolts; occasionally two bolts overlap.
+        if bolts.isEmpty {
+            spawnCountdown -= 1
+            if spawnCountdown <= 0 {
+                spawnBolt()
+                if nextRand() % 100 < 30 {
+                    secondCountdown = 6 + Int(nextRand() % 24)
+                }
+            }
+        } else if secondCountdown > 0 {
+            secondCountdown -= 1
+            if secondCountdown == 0, bolts.count < 2 {
+                spawnBolt()
+                secondCountdown = -1
+            }
+        }
+
+        for b in bolts.indices {
+            if bolts[b].flashing {
+                // Entire bolt path jumps to 1.0; bloom capped to every 3rd
+                // cell of the main channel only.
+                for idx in bolts[b].mainPath { trail[idx] = 1.0 }
+                for idx in bolts[b].branchPath { trail[idx] = 1.0 }
+                for (k, idx) in bolts[b].mainPath.enumerated() where k % 3 == 0 {
+                    bloomCells.append(idx)
+                }
+                bgLift = 0.16
+                bolts[b].flashLeft -= 1
+                if bolts[b].flashLeft <= 0 { bolts[b].done = true }
+            } else {
+                growBolt(b)
+            }
+        }
+
+        let hadBolts = !bolts.isEmpty
+        bolts.removeAll { $0.done }
+        if hadBolts && bolts.isEmpty {
+            // 1-4 s of dark floor before the next strike.
+            spawnCountdown = Int(config.fps * (1.0 + 3.0 * rand01()))
+            secondCountdown = -1
+        }
+    }
+
+    public override func animateOneFrame() {
+        if trail.isEmpty { rebuildGrid() }
+        stepLightning()
+        needsDisplay = true
+    }
+
+    // MARK: - Test hooks (same-module harness only)
+
+    var debugActiveBolts: Int { bolts.count }
+    var debugIsFlashing: Bool { bolts.contains { $0.flashing } }
+    var debugMainPathLen: Int { bolts.first?.mainPath.count ?? 0 }
+    var debugMaxTrail: CGFloat { trail.max() ?? 0 }
+
+    // MARK: - Drawing
+
+    public override func draw(_ dirtyRect: NSRect) {
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        if trail.isEmpty { rebuildGrid() }
+
+        drawBackground(ctx)
+
+        for j in 0..<rows {
+            let cy = originY + CGFloat(j) * pitch
+            let rowBase = j * cols
+            for i in 0..<cols {
+                let v = trail[rowBase + i]
+                let cx = originX + CGFloat(i) * pitch
+                if v <= 0 {
+                    drawCell(ctx, x: cx, y: cy, color: floorColor, bloom: false)
+                } else {
+                    let k = min(31, Int(v * 31 + 0.5))
+                    drawCell(ctx, x: cx, y: cy, color: cellColors[k], bloom: false)
+                }
+            }
+        }
+
+        // Bloom pass: only the flash frames' capped main-channel cells.
+        if config.bloom && !bloomCells.isEmpty {
+            for idx in bloomCells {
+                let j = idx / cols, i = idx % cols
+                drawCell(ctx,
+                         x: originX + CGFloat(i) * pitch,
+                         y: originY + CGFloat(j) * pitch,
+                         color: hotColor, bloom: true)
+            }
+        }
+    }
+
+    private func drawBackground(_ ctx: CGContext) {
+        let top = bgLift > 0 ? liftTopColor : bgTop.color
+        let bottom = bgLift > 0 ? liftBottomColor : bgBottom.color
+        let colors = [top.cgColor, bottom.cgColor] as CFArray
+        let space = CGColorSpace(name: CGColorSpace.sRGB)!
+        if let grad = CGGradient(colorsSpace: space, colors: colors, locations: [0, 1]) {
+            ctx.drawLinearGradient(grad,
+                                   start: CGPoint(x: 0, y: bounds.height),
+                                   end: CGPoint(x: 0, y: 0),
+                                   options: [])
+        } else {
+            top.setFill()
+            bounds.fill()
+        }
+    }
+
+    private func drawCell(_ ctx: CGContext, x: CGFloat, y: CGFloat,
+                          color: NSColor, bloom: Bool) {
+        let rect = NSRect(x: x - cellSide / 2, y: y - cellSide / 2,
+                          width: cellSide, height: cellSide)
+        let path = NSBezierPath(roundedRect: rect,
+                                xRadius: cellSide * 0.28, yRadius: cellSide * 0.28)
+        if bloom {
+            ctx.saveGState()
+            ctx.setShadow(offset: .zero, blur: cellSide * 1.2,
+                          color: color.withAlphaComponent(0.8).cgColor)
+            color.setFill()
+            path.fill()
+            ctx.restoreGState()
+        } else {
+            color.setFill()
+            path.fill()
+        }
+    }
+
+    // MARK: - Configure sheet
+
+    private var sheet: NSPanel?
+    private var themePopup: NSPopUpButton?
+    private var pitchSlider: NSSlider?
+    private var fpsSlider: NSSlider?
+    private var floorSlider: NSSlider?
+    private var bloomCheck: NSButton?
+
+    private var pitchDetentValues: [Double] = []
+
+    /// Pitches in [8, 80] where the grid shows NO partially cut cells on the
+    /// main screen. Grid math is untouched (cols = Int(w/p)+2, centered, cell
+    /// side 0.7p): the overflow edge cells are FULLY offscreen whenever the
+    /// fractional parts of w/p and h/p are <= 0.3. Scan that condition and
+    /// take the center of each valid band as a slider detent.
+    private static func pitchDetents() -> [Double] {
+        let size = NSScreen.main?.frame.size ?? NSSize(width: 1512, height: 982)
+        let w = Double(size.width), h = Double(size.height)
+        var runs: [[Double]] = []
+        var cur: [Double] = []
+        var p = 8.0
+        while p <= 80.0 {
+            let fw = w / p - (w / p).rounded(.down)
+            let fh = h / p - (h / p).rounded(.down)
+            if fw <= 0.3 && fh <= 0.3 {
+                cur.append(p)
+            } else if !cur.isEmpty {
+                runs.append(cur); cur = []
+            }
+            p += 0.1
+        }
+        if !cur.isEmpty { runs.append(cur) }
+        let detents = runs.map { ($0[$0.count / 2] * 10).rounded() / 10 }
+        return detents.isEmpty ? [26.0] : detents
+    }
+
+    public override var hasConfigureSheet: Bool { true }
+
+    public override var configureSheet: NSWindow? {
+        if let sheet { return sheet }
+        loadConfig()
+
+        // Fixed frames, no autolayout: the sheet is measured and presented
+        // remotely (legacyScreenSaver -> System Settings) before any layout
+        // pass runs; autolayout-sized panels collapse there.
+        let W: CGFloat = 440, H: CGFloat = 250
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: W, height: H),
+                            styleMask: [.titled],
+                            backing: .buffered, defer: false)
+        panel.title = "Relâmpagos"
+        panel.isReleasedWhenClosed = false
+
+        let content = panel.contentView!
+
+        func label(_ text: String, row y: CGFloat) -> NSTextField {
+            let l = NSTextField(labelWithString: text)
+            l.alignment = .right
+            l.frame = NSRect(x: 20, y: y, width: 150, height: 20)
+            content.addSubview(l)
+            return l
+        }
+        func slider(_ value: Double, _ minV: Double, _ maxV: Double,
+                    row y: CGFloat) -> NSSlider {
+            let s = NSSlider(value: value, minValue: minV, maxValue: maxV,
+                             target: nil, action: nil)
+            s.isContinuous = false
+            s.frame = NSRect(x: 180, y: y - 2, width: 240, height: 24)
+            content.addSubview(s)
+            return s
+        }
+
+        _ = label("Tema:", row: 202)
+        let popup = NSPopUpButton(frame: NSRect(x: 178, y: 196, width: 244, height: 26),
+                                  pullsDown: false)
+        popup.addItems(withTitles: Self.themes.map(\.name))
+        popup.selectItem(at: config.theme)
+        content.addSubview(popup)
+
+        _ = label("Espaçamento da grelha:", row: 164)
+        // Detented spacing slider: only positions with no cut cells.
+        let detents = Self.pitchDetents()
+        pitchDetentValues = detents
+        let nearestIdx = detents.enumerated().min {
+            abs($0.element - config.pitch) < abs($1.element - config.pitch)
+        }!.offset
+        let pSlider = slider(Double(nearestIdx), 0, Double(detents.count - 1), row: 164)
+        pSlider.numberOfTickMarks = detents.count
+        pSlider.allowsTickMarkValuesOnly = true
+        _ = label("Velocidade (fps):", row: 126)
+        let fSlider = slider(config.fps, 15, 60, row: 126)
+
+        _ = label("Brilho do fundo:", row: 88)
+        let flSlider = slider(config.floor, 0.0, 0.30, row: 88)
+
+        let bloom = NSButton(checkboxWithTitle: "Brilho (bloom) no clarão",
+                             target: nil, action: nil)
+        bloom.state = config.bloom ? .on : .off
+        bloom.frame = NSRect(x: 180, y: 56, width: 248, height: 20)
+        content.addSubview(bloom)
+
+        let cancel = NSButton(title: "Cancelar", target: self,
+                              action: #selector(sheetCancel(_:)))
+        cancel.bezelStyle = .rounded
+        cancel.frame = NSRect(x: W - 200, y: 12, width: 90, height: 30)
+        content.addSubview(cancel)
+
+        let ok = NSButton(title: "OK", target: self,
+                          action: #selector(sheetOK(_:)))
+        ok.bezelStyle = .rounded
+        ok.keyEquivalent = "\r"
+        ok.frame = NSRect(x: W - 102, y: 12, width: 82, height: 30)
+        content.addSubview(ok)
+
+        content.layoutSubtreeIfNeeded()
+
+        sheet = panel
+        themePopup = popup
+        pitchSlider = pSlider
+        fpsSlider = fSlider
+        floorSlider = flSlider
+        bloomCheck = bloom
+        return panel
+    }
+
+    @objc private func sheetOK(_ sender: Any?) {
+        if let d = Self.makeDefaults() {
+            d.set(themePopup?.indexOfSelectedItem ?? 0, forKey: "theme")
+            // The pitch slider carries a detent INDEX; translate to points.
+            let pitchIdx = Int((pitchSlider?.doubleValue ?? 0).rounded())
+            let pitchVal = pitchDetentValues.indices.contains(pitchIdx)
+                ? pitchDetentValues[pitchIdx] : 26.0
+            d.set(pitchVal, forKey: "pitch")
+            d.set(fpsSlider?.doubleValue ?? 30.0, forKey: "fps")
+            d.set(floorSlider?.doubleValue ?? 0.10, forKey: "floorLevel")
+            d.set(bloomCheck?.state == .on, forKey: "bloom")
+            d.synchronize()
+        }
+        NotificationCenter.default.post(name: .lightningConfigChanged, object: nil)
+        closeSheet()
+    }
+
+    @objc private func sheetCancel(_ sender: Any?) {
+        closeSheet()
+    }
+
+    private func closeSheet() {
+        guard let sheet else { return }
+        if let parent = sheet.sheetParent {
+            parent.endSheet(sheet)
+        } else {
+            sheet.close()
+        }
+    }
+}
