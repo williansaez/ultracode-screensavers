@@ -485,12 +485,239 @@ public final class UltracodeAtomView: ScreenSaverView {
         }
         electrons = keep
 
+        if tilePop > 0.01 { tilePop *= 0.86 } else { tilePop = 0 }
+
         needsDisplay = true
     }
 
     /// Harness hooks.
     @objc public var debugElectronCount: Int { electrons.count }
     @objc public func debugForceArrival() { framesToNextArrival = 1 }
+
+    // MARK: - Periodic table + info tile
+
+    private struct Element {
+        let sym: String, name: String, mass: String
+        init(_ sym: String, _ name: String, _ mass: String) {
+            self.sym = sym; self.name = name; self.mass = mass
+        }
+    }
+
+    /// Z = 1..118 (índice = Z-1). Nomes em português, massa atómica padrão
+    /// (sintéticos = isótopo mais estável, entre parênteses retos).
+    private static let elements: [Element] = [
+        Element("H", "Hidrogênio", "1,008"), Element("He", "Hélio", "4,003"),
+        Element("Li", "Lítio", "6,94"), Element("Be", "Berílio", "9,012"),
+        Element("B", "Boro", "10,81"), Element("C", "Carbono", "12,011"),
+        Element("N", "Nitrogênio", "14,007"), Element("O", "Oxigênio", "15,999"),
+        Element("F", "Flúor", "18,998"), Element("Ne", "Neônio", "20,180"),
+        Element("Na", "Sódio", "22,990"), Element("Mg", "Magnésio", "24,305"),
+        Element("Al", "Alumínio", "26,982"), Element("Si", "Silício", "28,085"),
+        Element("P", "Fósforo", "30,974"), Element("S", "Enxofre", "32,06"),
+        Element("Cl", "Cloro", "35,45"), Element("Ar", "Argônio", "39,95"),
+        Element("K", "Potássio", "39,098"), Element("Ca", "Cálcio", "40,078"),
+        Element("Sc", "Escândio", "44,956"), Element("Ti", "Titânio", "47,867"),
+        Element("V", "Vanádio", "50,942"), Element("Cr", "Cromo", "51,996"),
+        Element("Mn", "Manganês", "54,938"), Element("Fe", "Ferro", "55,845"),
+        Element("Co", "Cobalto", "58,933"), Element("Ni", "Níquel", "58,693"),
+        Element("Cu", "Cobre", "63,546"), Element("Zn", "Zinco", "65,38"),
+        Element("Ga", "Gálio", "69,723"), Element("Ge", "Germânio", "72,630"),
+        Element("As", "Arsênio", "74,922"), Element("Se", "Selênio", "78,971"),
+        Element("Br", "Bromo", "79,904"), Element("Kr", "Criptônio", "83,798"),
+        Element("Rb", "Rubídio", "85,468"), Element("Sr", "Estrôncio", "87,62"),
+        Element("Y", "Ítrio", "88,906"), Element("Zr", "Zircônio", "91,224"),
+        Element("Nb", "Nióbio", "92,906"), Element("Mo", "Molibdênio", "95,95"),
+        Element("Tc", "Tecnécio", "[98]"), Element("Ru", "Rutênio", "101,07"),
+        Element("Rh", "Ródio", "102,91"), Element("Pd", "Paládio", "106,42"),
+        Element("Ag", "Prata", "107,87"), Element("Cd", "Cádmio", "112,41"),
+        Element("In", "Índio", "114,82"), Element("Sn", "Estanho", "118,71"),
+        Element("Sb", "Antimônio", "121,76"), Element("Te", "Telúrio", "127,60"),
+        Element("I", "Iodo", "126,90"), Element("Xe", "Xenônio", "131,29"),
+        Element("Cs", "Césio", "132,91"), Element("Ba", "Bário", "137,33"),
+        Element("La", "Lantânio", "138,91"), Element("Ce", "Cério", "140,12"),
+        Element("Pr", "Praseodímio", "140,91"), Element("Nd", "Neodímio", "144,24"),
+        Element("Pm", "Promécio", "[145]"), Element("Sm", "Samário", "150,36"),
+        Element("Eu", "Európio", "151,96"), Element("Gd", "Gadolínio", "157,25"),
+        Element("Tb", "Térbio", "158,93"), Element("Dy", "Disprósio", "162,50"),
+        Element("Ho", "Hólmio", "164,93"), Element("Er", "Érbio", "167,26"),
+        Element("Tm", "Túlio", "168,93"), Element("Yb", "Itérbio", "173,05"),
+        Element("Lu", "Lutécio", "174,97"), Element("Hf", "Háfnio", "178,49"),
+        Element("Ta", "Tântalo", "180,95"), Element("W", "Tungstênio", "183,84"),
+        Element("Re", "Rênio", "186,21"), Element("Os", "Ósmio", "190,23"),
+        Element("Ir", "Irídio", "192,22"), Element("Pt", "Platina", "195,08"),
+        Element("Au", "Ouro", "196,97"), Element("Hg", "Mercúrio", "200,59"),
+        Element("Tl", "Tálio", "204,38"), Element("Pb", "Chumbo", "207,2"),
+        Element("Bi", "Bismuto", "208,98"), Element("Po", "Polônio", "[209]"),
+        Element("At", "Astato", "[210]"), Element("Rn", "Radônio", "[222]"),
+        Element("Fr", "Frâncio", "[223]"), Element("Ra", "Rádio", "[226]"),
+        Element("Ac", "Actínio", "[227]"), Element("Th", "Tório", "232,04"),
+        Element("Pa", "Protactínio", "231,04"), Element("U", "Urânio", "238,03"),
+        Element("Np", "Netúnio", "[237]"), Element("Pu", "Plutônio", "[244]"),
+        Element("Am", "Amerício", "[243]"), Element("Cm", "Cúrio", "[247]"),
+        Element("Bk", "Berquélio", "[247]"), Element("Cf", "Califórnio", "[251]"),
+        Element("Es", "Einstênio", "[252]"), Element("Fm", "Férmio", "[257]"),
+        Element("Md", "Mendelévio", "[258]"), Element("No", "Nobélio", "[259]"),
+        Element("Lr", "Laurêncio", "[266]"), Element("Rf", "Rutherfórdio", "[267]"),
+        Element("Db", "Dúbnio", "[268]"), Element("Sg", "Seabórgio", "[269]"),
+        Element("Bh", "Bóhrio", "[270]"), Element("Hs", "Hássio", "[269]"),
+        Element("Mt", "Meitnério", "[278]"), Element("Ds", "Darmstácio", "[281]"),
+        Element("Rg", "Roentgênio", "[282]"), Element("Cn", "Copernício", "[285]"),
+        Element("Nh", "Nihônio", "[286]"), Element("Fl", "Fleróvio", "[289]"),
+        Element("Mc", "Moscóvio", "[290]"), Element("Lv", "Livermório", "[293]"),
+        Element("Ts", "Tenesso", "[294]"), Element("Og", "Oganessônio", "[294]"),
+    ]
+
+    private var tileImage: CGImage?
+    private var tileZ = 0
+    private var tileThemeKey = -1
+    private var tileSize = NSSize.zero
+    private var tileScaleKey: CGFloat = 0
+    private var tilePop: CGFloat = 0     // brief scale bump when the element changes
+
+    private func currentZ() -> Int { min(Self.elements.count, max(1, protonCount)) }
+
+    /// Top-left tile rect (view coords, y-up), scaled to the view.
+    private func elementTileRect() -> CGRect {
+        let s = min(bounds.width, bounds.height)
+        let w = min(212, max(132, s * 0.17))
+        let h = w * 1.16
+        let m = max(16, w * 0.18)
+        return CGRect(x: m, y: bounds.height - h - m, width: w, height: h)
+    }
+
+    private func attrSize(_ s: String, _ f: NSFont) -> NSSize {
+        (s as NSString).size(withAttributes: [.font: f])
+    }
+    private func drawText(_ s: String, _ f: NSFont, _ c: NSColor, at p: CGPoint) {
+        (s as NSString).draw(at: p, withAttributes: [.font: f, .foregroundColor: c])
+    }
+
+    /// Renders the element info tile with an Apple "liquid glass" look:
+    /// frosted translucent panel, top specular streak, bright top border,
+    /// accent under-glow, drop shadow. Cached per (Z, theme, size, scale).
+    private func makeElementTile(z: Int, size: NSSize, scale: CGFloat) -> CGImage? {
+        let W = size.width, H = size.height
+        let pxW = max(1, Int((W * scale).rounded(.up)))
+        let pxH = max(1, Int((H * scale).rounded(.up)))
+        guard z >= 1, z <= Self.elements.count,
+              let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let ctx = CGContext(data: nil, width: pxW, height: pxH,
+                                  bitsPerComponent: 8, bytesPerRow: 0, space: space,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return nil }
+        ctx.scaleBy(x: scale, y: scale)
+        let ns = NSGraphicsContext(cgContext: ctx, flipped: false)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = ns
+
+        let inset: CGFloat = 9
+        let body = CGRect(x: inset, y: inset, width: W - 2 * inset, height: H - 2 * inset)
+        let r = body.width * 0.24
+        let path = NSBezierPath(roundedRect: body, xRadius: r, yRadius: r)
+        let acc = contrastAccent(forTheme: config.theme)
+
+        // Drop shadow.
+        ctx.saveGState()
+        ctx.setShadow(offset: CGSize(width: 0, height: -3), blur: 18,
+                      color: NSColor(white: 0, alpha: 0.5).cgColor)
+        NSColor(white: 1, alpha: 0.06).setFill()
+        path.fill()
+        ctx.restoreGState()
+
+        // Frosted body + accent under-glow + top specular streak (clipped).
+        ctx.saveGState()
+        path.addClip()
+        if let g = CGGradient(colorsSpace: space, colors: [
+            NSColor(white: 1, alpha: 0.20).cgColor,
+            NSColor(white: 1, alpha: 0.06).cgColor,
+            NSColor(white: 1, alpha: 0.02).cgColor] as CFArray, locations: [0, 0.5, 1]) {
+            ctx.drawLinearGradient(g, start: CGPoint(x: body.midX, y: body.maxY),
+                                   end: CGPoint(x: body.midX, y: body.minY), options: [])
+        }
+        if let ag = CGGradient(colorsSpace: space, colors: [
+            NSColor(srgbRed: acc.r, green: acc.g, blue: acc.b, alpha: 0.16).cgColor,
+            NSColor(srgbRed: acc.r, green: acc.g, blue: acc.b, alpha: 0).cgColor] as CFArray,
+            locations: [0, 1]) {
+            let c = CGPoint(x: body.midX, y: body.minY + body.height * 0.26)
+            ctx.drawRadialGradient(ag, startCenter: c, startRadius: 0,
+                                   endCenter: c, endRadius: body.width * 0.7, options: [])
+        }
+        let streak = NSBezierPath(roundedRect: CGRect(
+            x: body.minX + body.width * 0.12, y: body.maxY - body.height * 0.11,
+            width: body.width * 0.76, height: body.height * 0.05), xRadius: 6, yRadius: 6)
+        NSColor(white: 1, alpha: 0.38).setFill()
+        streak.fill()
+        ctx.restoreGState()
+
+        // Borders: subtle all around, brighter on the top half.
+        path.lineWidth = 1.2
+        NSColor(white: 1, alpha: 0.22).setStroke()
+        path.stroke()
+        ctx.saveGState()
+        NSBezierPath(rect: CGRect(x: body.minX - 2, y: body.midY,
+                                  width: body.width + 4, height: body.height / 2 + 4)).addClip()
+        path.lineWidth = 1.4
+        NSColor(white: 1, alpha: 0.5).setStroke()
+        path.stroke()
+        ctx.restoreGState()
+
+        // Text.
+        let el = Self.elements[z - 1]
+        let white = NSColor(white: 1, alpha: 0.95)
+        let dim = NSColor(white: 1, alpha: 0.62)
+        let accColor = NSColor(srgbRed: min(1, acc.r * 1.15), green: min(1, acc.g * 1.15),
+                               blue: min(1, acc.b * 1.15), alpha: 1)
+        let pad = body.width * 0.12
+
+        let numF = NSFont.systemFont(ofSize: body.width * 0.15, weight: .semibold)
+        drawText("\(z)", numF, white,
+                 at: CGPoint(x: body.minX + pad,
+                             y: body.maxY - pad * 0.7 - attrSize("\(z)", numF).height))
+
+        let massF = NSFont.systemFont(ofSize: body.width * 0.11, weight: .regular)
+        let ms = attrSize(el.mass, massF)
+        drawText(el.mass, massF, dim,
+                 at: CGPoint(x: body.maxX - pad - ms.width,
+                             y: body.maxY - pad * 0.7 - ms.height))
+
+        let symF = NSFont.systemFont(ofSize: body.width * 0.42, weight: .bold)
+        let ss = attrSize(el.sym, symF)
+        drawText(el.sym, symF, accColor,
+                 at: CGPoint(x: body.midX - ss.width / 2,
+                             y: body.minY + body.height * 0.40 - ss.height / 2))
+
+        var nameF = NSFont.systemFont(ofSize: body.width * 0.115, weight: .medium)
+        var nm = attrSize(el.name, nameF)
+        if nm.width > body.width - pad {     // shrink long names to fit
+            nameF = NSFont.systemFont(ofSize: body.width * 0.115 * (body.width - pad) / nm.width,
+                                      weight: .medium)
+            nm = attrSize(el.name, nameF)
+        }
+        drawText(el.name, nameF, white,
+                 at: CGPoint(x: body.midX - nm.width / 2, y: body.minY + pad * 0.7))
+
+        NSGraphicsContext.restoreGraphicsState()
+        return ctx.makeImage()
+    }
+
+    private func drawElementTile(_ ctx: CGContext) {
+        guard !isPreview, bounds.width >= 240 else { return }
+        let z = currentZ()
+        let rect = elementTileRect()
+        let scale = window?.backingScaleFactor ?? 2
+        if tileImage == nil || z != tileZ || config.theme != tileThemeKey
+            || tileSize != rect.size || tileScaleKey != scale {
+            if z != tileZ && tileZ != 0 { tilePop = 1 }   // element changed: pop
+            tileImage = makeElementTile(z: z, size: rect.size, scale: scale)
+            tileZ = z; tileThemeKey = config.theme
+            tileSize = rect.size; tileScaleKey = scale
+        }
+        guard let img = tileImage else { return }
+        let p = 1 + 0.06 * tilePop
+        let drawRect = rect.insetBy(dx: -rect.width * (p - 1) / 2,
+                                    dy: -rect.height * (p - 1) / 2)
+        ctx.draw(img, in: drawRect)
+    }
 
     // MARK: - Drawing
 
@@ -561,6 +788,9 @@ public final class UltracodeAtomView: ScreenSaverView {
                      y: originY + CGFloat(gy) * pitch,
                      color: electronColor, bloom: config.bloom)
         }
+
+        // Element info tile (liquid glass) on top of everything.
+        drawElementTile(ctx)
     }
 
     private func drawBackground(_ ctx: CGContext) {
