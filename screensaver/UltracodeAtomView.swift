@@ -486,6 +486,7 @@ public final class UltracodeAtomView: ScreenSaverView {
         electrons = keep
 
         if tilePop > 0.01 { tilePop *= 0.86 } else { tilePop = 0 }
+        updateTileHover()
 
         needsDisplay = true
     }
@@ -493,6 +494,11 @@ public final class UltracodeAtomView: ScreenSaverView {
     /// Harness hooks.
     @objc public var debugElectronCount: Int { electrons.count }
     @objc public func debugForceArrival() { framesToNextArrival = 1 }
+    @objc public func debugSetProtons(_ n: Int) {
+        protonCount = max(1, n); ensureProtonCapacity(protonCount)
+    }
+    @objc public func debugSetTileLayout(_ i: Int) { tileLayout = i; tileImage = nil }
+    @objc public func debugSetTileAlpha(_ a: CGFloat) { forceTileAlpha = a }
 
     // MARK: - Periodic table + info tile
 
@@ -569,10 +575,18 @@ public final class UltracodeAtomView: ScreenSaverView {
 
     private var tileImage: CGImage?
     private var tileZ = 0
-    private var tileThemeKey = -1
+    private var tileLayoutKey = -1
     private var tileSize = NSSize.zero
     private var tileScaleKey: CGFloat = 0
     private var tilePop: CGFloat = 0     // brief scale bump when the element changes
+
+    /// Layout 0 = periodic cell, 1 = minimal, 2 = hero+caption.
+    private var tileLayout = 0
+    /// The tile is nearly invisible at rest and fades up on cursor hover.
+    private let tileRestAlpha: CGFloat = 0.12
+    private let tileHoverAlpha: CGFloat = 0.92
+    private var tileAlpha: CGFloat = 0.12
+    private var forceTileAlpha: CGFloat = -1   // harness override
 
     private func currentZ() -> Int { min(Self.elements.count, max(1, protonCount)) }
 
@@ -614,7 +628,6 @@ public final class UltracodeAtomView: ScreenSaverView {
         let body = CGRect(x: inset, y: inset, width: W - 2 * inset, height: H - 2 * inset)
         let r = body.width * 0.24
         let path = NSBezierPath(roundedRect: body, xRadius: r, yRadius: r)
-        let acc = contrastAccent(forTheme: config.theme)
 
         // Drop shadow.
         ctx.saveGState()
@@ -624,7 +637,7 @@ public final class UltracodeAtomView: ScreenSaverView {
         path.fill()
         ctx.restoreGState()
 
-        // Frosted body + accent under-glow + top specular streak (clipped).
+        // Frosted body (neutral, no color tint) + top specular streak.
         ctx.saveGState()
         path.addClip()
         if let g = CGGradient(colorsSpace: space, colors: [
@@ -633,14 +646,6 @@ public final class UltracodeAtomView: ScreenSaverView {
             NSColor(white: 1, alpha: 0.02).cgColor] as CFArray, locations: [0, 0.5, 1]) {
             ctx.drawLinearGradient(g, start: CGPoint(x: body.midX, y: body.maxY),
                                    end: CGPoint(x: body.midX, y: body.minY), options: [])
-        }
-        if let ag = CGGradient(colorsSpace: space, colors: [
-            NSColor(srgbRed: acc.r, green: acc.g, blue: acc.b, alpha: 0.16).cgColor,
-            NSColor(srgbRed: acc.r, green: acc.g, blue: acc.b, alpha: 0).cgColor] as CFArray,
-            locations: [0, 1]) {
-            let c = CGPoint(x: body.midX, y: body.minY + body.height * 0.26)
-            ctx.drawRadialGradient(ag, startCenter: c, startRadius: 0,
-                                   endCenter: c, endRadius: body.width * 0.7, options: [])
         }
         let streak = NSBezierPath(roundedRect: CGRect(
             x: body.minX + body.width * 0.12, y: body.maxY - body.height * 0.11,
@@ -661,43 +666,70 @@ public final class UltracodeAtomView: ScreenSaverView {
         path.stroke()
         ctx.restoreGState()
 
-        // Text.
-        let el = Self.elements[z - 1]
-        let white = NSColor(white: 1, alpha: 0.95)
-        let dim = NSColor(white: 1, alpha: 0.62)
-        let accColor = NSColor(srgbRed: min(1, acc.r * 1.15), green: min(1, acc.g * 1.15),
-                               blue: min(1, acc.b * 1.15), alpha: 1)
-        let pad = body.width * 0.12
-
-        let numF = NSFont.systemFont(ofSize: body.width * 0.15, weight: .semibold)
-        drawText("\(z)", numF, white,
-                 at: CGPoint(x: body.minX + pad,
-                             y: body.maxY - pad * 0.7 - attrSize("\(z)", numF).height))
-
-        let massF = NSFont.systemFont(ofSize: body.width * 0.11, weight: .regular)
-        let ms = attrSize(el.mass, massF)
-        drawText(el.mass, massF, dim,
-                 at: CGPoint(x: body.maxX - pad - ms.width,
-                             y: body.maxY - pad * 0.7 - ms.height))
-
-        let symF = NSFont.systemFont(ofSize: body.width * 0.42, weight: .bold)
-        let ss = attrSize(el.sym, symF)
-        drawText(el.sym, symF, accColor,
-                 at: CGPoint(x: body.midX - ss.width / 2,
-                             y: body.minY + body.height * 0.40 - ss.height / 2))
-
-        var nameF = NSFont.systemFont(ofSize: body.width * 0.115, weight: .medium)
-        var nm = attrSize(el.name, nameF)
-        if nm.width > body.width - pad {     // shrink long names to fit
-            nameF = NSFont.systemFont(ofSize: body.width * 0.115 * (body.width - pad) / nm.width,
-                                      weight: .medium)
-            nm = attrSize(el.name, nameF)
-        }
-        drawText(el.name, nameF, white,
-                 at: CGPoint(x: body.midX - nm.width / 2, y: body.minY + pad * 0.7))
+        drawTileText(z: z, body: body, layout: tileLayout)
 
         NSGraphicsContext.restoreGraphicsState()
         return ctx.makeImage()
+    }
+
+    /// Three neutral (colorless) layouts, symbol always centered. The symbol
+    /// is rendered with a tiny optical nudge so its visual mass sits on the
+    /// tile's true vertical center.
+    private func drawTileText(z: Int, body: CGRect, layout: Int) {
+        let el = Self.elements[z - 1]
+        let white = NSColor(white: 1, alpha: 0.95)
+        let dim = NSColor(white: 1, alpha: 0.6)
+        let pad = body.width * 0.12
+        let cx = body.midX
+
+        func centered(_ s: String, _ f: NSFont, _ c: NSColor, yBottom: CGFloat) {
+            drawText(s, f, c, at: CGPoint(x: cx - attrSize(s, f).width / 2, y: yBottom))
+        }
+        func fitFont(_ s: String, _ size: CGFloat, _ w: NSFont.Weight, maxW: CGFloat) -> NSFont {
+            let f = NSFont.systemFont(ofSize: size, weight: w)
+            let sw = attrSize(s, f).width
+            return sw > maxW ? NSFont.systemFont(ofSize: size * maxW / sw, weight: w) : f
+        }
+
+        switch layout {
+        case 1:
+            // Minimal: Z above, big symbol dead-center, name below. No mass.
+            let symF = NSFont.systemFont(ofSize: body.width * 0.50, weight: .bold)
+            let sh = attrSize(el.sym, symF).height
+            let symBottom = body.midY - sh * 0.44
+            centered(el.sym, symF, white, yBottom: symBottom)
+            let numF = NSFont.systemFont(ofSize: body.width * 0.13, weight: .semibold)
+            centered("\(z)", numF, dim, yBottom: symBottom + sh + body.height * 0.015)
+            let nameF = fitFont(el.name, body.width * 0.12, .medium, maxW: body.width - pad)
+            centered(el.name, nameF, white,
+                     yBottom: symBottom - attrSize(el.name, nameF).height - body.height * 0.02)
+
+        case 2:
+            // Hero: huge symbol centered, one tiny caption line at the bottom.
+            let symF = NSFont.systemFont(ofSize: body.width * 0.56, weight: .bold)
+            let sh = attrSize(el.sym, symF).height
+            centered(el.sym, symF, white, yBottom: body.midY - sh * 0.40 + body.height * 0.03)
+            let cap = "\(z) · \(el.name) · \(el.mass)"
+            let capF = fitFont(cap, body.width * 0.10, .regular, maxW: body.width - pad * 0.6)
+            centered(cap, capF, dim, yBottom: body.minY + pad * 0.7)
+
+        default:
+            // Periodic cell: Z top-left, mass top-right, symbol centered, name bottom.
+            let numF = NSFont.systemFont(ofSize: body.width * 0.15, weight: .semibold)
+            drawText("\(z)", numF, white,
+                     at: CGPoint(x: body.minX + pad,
+                                 y: body.maxY - pad * 0.7 - attrSize("\(z)", numF).height))
+            let massF = NSFont.systemFont(ofSize: body.width * 0.11, weight: .regular)
+            let ms = attrSize(el.mass, massF)
+            drawText(el.mass, massF, dim,
+                     at: CGPoint(x: body.maxX - pad - ms.width,
+                                 y: body.maxY - pad * 0.7 - ms.height))
+            let symF = NSFont.systemFont(ofSize: body.width * 0.42, weight: .bold)
+            let sh = attrSize(el.sym, symF).height
+            centered(el.sym, symF, white, yBottom: body.midY - sh * 0.42)
+            let nameF = fitFont(el.name, body.width * 0.115, .medium, maxW: body.width - pad)
+            centered(el.name, nameF, white, yBottom: body.minY + pad * 0.7)
+        }
     }
 
     private func drawElementTile(_ ctx: CGContext) {
@@ -705,18 +737,34 @@ public final class UltracodeAtomView: ScreenSaverView {
         let z = currentZ()
         let rect = elementTileRect()
         let scale = window?.backingScaleFactor ?? 2
-        if tileImage == nil || z != tileZ || config.theme != tileThemeKey
+        if tileImage == nil || z != tileZ || tileLayout != tileLayoutKey
             || tileSize != rect.size || tileScaleKey != scale {
             if z != tileZ && tileZ != 0 { tilePop = 1 }   // element changed: pop
             tileImage = makeElementTile(z: z, size: rect.size, scale: scale)
-            tileZ = z; tileThemeKey = config.theme
+            tileZ = z; tileLayoutKey = tileLayout
             tileSize = rect.size; tileScaleKey = scale
         }
         guard let img = tileImage else { return }
         let p = 1 + 0.06 * tilePop
         let drawRect = rect.insetBy(dx: -rect.width * (p - 1) / 2,
                                     dy: -rect.height * (p - 1) / 2)
+        let a = forceTileAlpha >= 0 ? forceTileAlpha : tileAlpha
+        ctx.saveGState()
+        ctx.setAlpha(a)
         ctx.draw(img, in: drawRect)
+        ctx.restoreGState()
+    }
+
+    /// Ease the tile opacity toward rest/hover based on the cursor position.
+    private func updateTileHover() {
+        var target = tileRestAlpha
+        if let win = window {
+            let p = convert(win.mouseLocationOutsideOfEventStream, from: nil)
+            if elementTileRect().insetBy(dx: -6, dy: -6).contains(p) {
+                target = tileHoverAlpha
+            }
+        }
+        tileAlpha += (target - tileAlpha) * 0.18
     }
 
     // MARK: - Drawing
