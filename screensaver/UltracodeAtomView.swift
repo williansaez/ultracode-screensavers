@@ -429,7 +429,11 @@ public final class UltracodeAtomView: ScreenSaverView {
 
         framesToNextArrival -= 1
         if framesToNextArrival <= 0 {
-            spawnIncoming()
+            // Hard cap at element 118 (Oganessônio) — the periodic table ends
+            // there. Count settled + in-flight electrons (each holds a proton)
+            // so we never overshoot Z = 118.
+            let pending = electrons.lazy.filter { $0.outFrames == 0 }.count
+            if pending < Self.elements.count { spawnIncoming() }
             framesToNextArrival = Int(config.fps * (6.0 + 6.0 * Double(randF())))
         }
 
