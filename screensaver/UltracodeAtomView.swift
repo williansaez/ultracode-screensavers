@@ -74,6 +74,7 @@ public final class UltracodeAtomView: ScreenSaverView {
         var pitch: Double = 26
         var fps: Double = 30
         var floor: Double = 0.10  // empty-cell brightness on the theme ramp
+        var arrival: Double = 8   // mean seconds between new electrons
         var bloom = true
     }
 
@@ -86,6 +87,7 @@ public final class UltracodeAtomView: ScreenSaverView {
             "pitch": 26.0,
             "fps": 30.0,
             "floorLevel": 0.10,
+            "arrivalSecs": 8.0,
             "bloom": true,
         ])
         return d
@@ -99,6 +101,7 @@ public final class UltracodeAtomView: ScreenSaverView {
         config.pitch = min(max(d.double(forKey: "pitch"), 8.0), 80.0)
         config.fps = min(max(d.double(forKey: "fps"), 15.0), 60.0)
         config.floor = min(max(d.double(forKey: "floorLevel"), 0.0), 0.30)
+        config.arrival = min(max(d.double(forKey: "arrivalSecs"), 1.0), 20.0)
         config.bloom = d.bool(forKey: "bloom")
         animationTimeInterval = 1.0 / config.fps
     }
@@ -434,7 +437,8 @@ public final class UltracodeAtomView: ScreenSaverView {
             // so we never overshoot Z = 118.
             let pending = electrons.lazy.filter { $0.outFrames == 0 }.count
             if pending < Self.elements.count { spawnIncoming() }
-            framesToNextArrival = Int(config.fps * (6.0 + 6.0 * Double(randF())))
+            // Mean interval from the user's "Tempo de entrada" setting, ±25%.
+            framesToNextArrival = Int(config.fps * config.arrival * (0.75 + 0.5 * Double(randF())))
         }
 
         // Exclusion check: if the proton cluster has grown to within the
@@ -885,6 +889,7 @@ public final class UltracodeAtomView: ScreenSaverView {
     private var themePopup: NSPopUpButton?
     private var pitchSlider: NSSlider?
     private var fpsSlider: NSSlider?
+    private var arrivalSlider: NSSlider?
     private var floorSlider: NSSlider?
     private var bloomCheck: NSButton?
     private var pitchDetentValues: [Double] = []
@@ -922,7 +927,7 @@ public final class UltracodeAtomView: ScreenSaverView {
 
         // Fixed frames, no autolayout (legacyScreenSaver presents the sheet
         // remotely before any layout pass; autolayout panels collapse there).
-        let W: CGFloat = 440, H: CGFloat = 250
+        let W: CGFloat = 440, H: CGFloat = 288
         let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: W, height: H),
                             styleMask: [.titled],
                             backing: .buffered, defer: false)
@@ -948,8 +953,8 @@ public final class UltracodeAtomView: ScreenSaverView {
             return s
         }
 
-        _ = label("Tema:", row: 202)
-        let popup = NSPopUpButton(frame: NSRect(x: 178, y: 196, width: 244, height: 26),
+        _ = label("Tema:", row: 240)
+        let popup = NSPopUpButton(frame: NSRect(x: 178, y: 234, width: 244, height: 26),
                                   pullsDown: false)
         popup.addItems(withTitles: Self.themes.map(\.name))
         popup.selectItem(at: config.theme)
@@ -961,13 +966,16 @@ public final class UltracodeAtomView: ScreenSaverView {
         let nearestIdx = detents.enumerated().min {
             abs($0.element - config.pitch) < abs($1.element - config.pitch)
         }!.offset
-        _ = label("Espaçamento da grelha:", row: 164)
-        let pSlider = slider(Double(nearestIdx), 0, Double(detents.count - 1), row: 164)
+        _ = label("Espaçamento da grelha:", row: 202)
+        let pSlider = slider(Double(nearestIdx), 0, Double(detents.count - 1), row: 202)
         pSlider.numberOfTickMarks = detents.count
         pSlider.allowsTickMarkValuesOnly = true
 
-        _ = label("Velocidade (fps):", row: 126)
-        let fSlider = slider(config.fps, 15, 60, row: 126)
+        _ = label("Velocidade (fps):", row: 164)
+        let fSlider = slider(config.fps, 15, 60, row: 164)
+
+        _ = label("Tempo de entrada (s):", row: 126)
+        let aSlider = slider(config.arrival, 1, 20, row: 126)
 
         _ = label("Brilho do fundo:", row: 88)
         let flSlider = slider(config.floor, 0.0, 0.30, row: 88)
@@ -997,6 +1005,7 @@ public final class UltracodeAtomView: ScreenSaverView {
         themePopup = popup
         pitchSlider = pSlider
         fpsSlider = fSlider
+        arrivalSlider = aSlider
         floorSlider = flSlider
         bloomCheck = bloom
         return panel
@@ -1011,6 +1020,7 @@ public final class UltracodeAtomView: ScreenSaverView {
                 ? pitchDetentValues[pitchIdx] : 26.0
             d.set(pitchVal, forKey: "pitch")
             d.set(fpsSlider?.doubleValue ?? 30.0, forKey: "fps")
+            d.set(arrivalSlider?.doubleValue ?? 8.0, forKey: "arrivalSecs")
             d.set(floorSlider?.doubleValue ?? 0.10, forKey: "floorLevel")
             d.set(bloomCheck?.state == .on, forKey: "bloom")
             d.synchronize()
