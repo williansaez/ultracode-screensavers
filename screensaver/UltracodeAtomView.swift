@@ -101,7 +101,7 @@ public final class UltracodeAtomView: ScreenSaverView {
         config.pitch = min(max(d.double(forKey: "pitch"), 8.0), 80.0)
         config.fps = min(max(d.double(forKey: "fps"), 15.0), 60.0)
         config.floor = min(max(d.double(forKey: "floorLevel"), 0.0), 0.30)
-        config.arrival = min(max(d.double(forKey: "arrivalSecs"), 1.0), 20.0)
+        config.arrival = min(max(d.double(forKey: "arrivalSecs"), 1.0), 300.0)
         config.bloom = d.bool(forKey: "bloom")
         animationTimeInterval = 1.0 / config.fps
     }
@@ -975,7 +975,7 @@ public final class UltracodeAtomView: ScreenSaverView {
         let fSlider = slider(config.fps, 15, 60, row: 164)
 
         _ = label("Tempo de entrada (s):", row: 126)
-        let aSlider = slider(config.arrival, 1, 20, row: 126)
+        let aSlider = slider(config.arrival, 1, 300, row: 126)
 
         _ = label("Brilho do fundo:", row: 88)
         let flSlider = slider(config.floor, 0.0, 0.30, row: 88)
