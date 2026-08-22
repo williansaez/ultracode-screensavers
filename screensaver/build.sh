@@ -22,12 +22,20 @@ SAVERS=(
   "UltracodeSnake"
   "UltracodePong"
   "UltracodeAtom"
+  "UltracodeChromaticWaves:Metal"
+  "UltracodeTextWave"
+  "UltracodeParticleSphere:Metal"
+  "UltracodeGlobe"
+  "UltracodePixelCard"
+  "UltracodeDotMatrix"
+  "UltracodeLineRipple"
 )
 
 for spec in "${SAVERS[@]}"; do
   name="${spec%%:*}"
   extra=""
   [[ "$spec" == *:IOKit ]] && extra="-framework IOKit"
+  [[ "$spec" == *:Metal ]] && extra="-framework Metal -framework QuartzCore"
   echo "→ $name"
   mkdir -p "$name.saver/Contents/MacOS"
   # shellcheck disable=SC2086
