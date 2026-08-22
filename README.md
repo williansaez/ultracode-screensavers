@@ -25,7 +25,9 @@ Painel de **Opções…** partilhado nas Definições de Proteção de Ecrã:
 
 ### Réplicas originkit
 
-Cada réplica tem a sua folha de opções: **Tema** (Base = visual original · Lavanda · Doom · Matrix), **Velocidade** (0.25×–3×) e extras próprios (indicados em cada saver abaixo). Nos temas coloridos o tom é uniforme; quando há destaque, vem da dinâmica (ex.: velocidade de rotação), nunca de gradientes espaciais.
+Cada réplica tem a sua folha de opções: **Tema** (Base = visual original · Lavanda · Doom · Matrix — a Matriz de Pontos tem também Mono), **Velocidade** (0.25×–3×) e extras próprios (indicados em cada saver abaixo). Nos temas coloridos o tom é uniforme; quando há destaque, vem da dinâmica (ex.: velocidade de rotação), nunca de gradientes espaciais.
+
+> **Capturas deste README**: 1280×800, tudo a preto e branco — tema **Mono** na suite ultracode, **Base** nas réplicas (Matriz de Pontos em Mono) — e **todos os parâmetros a meio da escala** dos respetivos sliders. Única exceção: a Bateria mantém as cores semânticas de estado.
 
 ## Suite ultracode
 
