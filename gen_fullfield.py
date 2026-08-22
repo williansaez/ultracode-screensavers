@@ -234,5 +234,5 @@ out = Image.composite(out, black, vig)
 # Downscale and save
 # ----------------------------------------------------------------------------
 final = out.resize((FINAL_W, FINAL_H), Image.LANCZOS)
-final.save("/Users/williansaez/GitHub/Wallpaper/variant_fullfield.png", "PNG")
+final.save("/Users/williansaez/GitHub/Wallpaper/screenshots/variant_fullfield.png", "PNG")
 print("saved", final.size)

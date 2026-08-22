@@ -200,6 +200,6 @@ draw.rounded_rectangle(
 # Downscale + save
 # ----------------------------------------------------------------------------
 final = bg.resize((W, H), Image.LANCZOS)
-out = "/Users/williansaez/GitHub/Wallpaper/variant_minimal.png"
+out = "/Users/williansaez/GitHub/Wallpaper/screenshots/variant_minimal.png"
 final.save(out, "PNG")
 print("saved", out, final.size)

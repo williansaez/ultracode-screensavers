@@ -270,7 +270,7 @@ def main():
     final = Image.fromarray(out, "RGB")
 
     final = final.resize((FINAL_W, FINAL_H), Image.LANCZOS)
-    final.save("/Users/williansaez/GitHub/Wallpaper/variant_wavefield.png",
+    final.save("/Users/williansaez/GitHub/Wallpaper/screenshots/variant_wavefield.png",
                optimize=True)
     print("saved", final.size, "leading cells:", n_lead)
 

@@ -199,8 +199,8 @@ screensaver/
   build.sh                 # compila + assina + instala tudo
   preview.sh               # um saver numa janela
   gallery.sh               # galeria navegável com acesso às opções
-screenshots/               # capturas usadas neste README
-variant_*.png              # wallpapers estáticos 3024×1964 com a mesma estética
+screenshots/               # todas as imagens: capturas do README + variant_*.png
+                           # (wallpapers estáticos 3024×1964 com a mesma estética)
 ```
 
 Cada saver tem um harness offline que instancia a view, bombeia frames e grava PNGs — é assim que tudo é verificado visualmente sem instalar.

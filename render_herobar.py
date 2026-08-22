@@ -3,7 +3,7 @@
 Ultracode herobar wallpaper — faithful recreation of the Claude Code "ultracode"
 shimmer bar as a centered hero element.
 
-Output: /Users/williansaez/GitHub/Wallpaper/variant_herobar.png  (3024x1964)
+Output: /Users/williansaez/GitHub/Wallpaper/screenshots/variant_herobar.png  (3024x1964)
 Rendered at 2x supersample, LANCZOS downscale.
 """
 
@@ -20,7 +20,7 @@ FINAL_W, FINAL_H = 3024, 1964
 SS = 2
 W, H = FINAL_W * SS, FINAL_H * SS
 
-OUT_PATH = "/Users/williansaez/GitHub/Wallpaper/variant_herobar.png"
+OUT_PATH = "/Users/williansaez/GitHub/Wallpaper/screenshots/variant_herobar.png"
 
 BG_TOP = (0x23, 0x21, 0x26)
 BG_BOTTOM = (0x1B, 0x19, 0x1E)
