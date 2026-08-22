@@ -15,9 +15,9 @@ import AppKit
 //
 // Configuração (ScreenSaverDefaults "com.williansaez.ultracode-lineripple"):
 //   theme    — 0 Base (branco), 1 Ultracode (lavanda), 2 Doom clássico, 3 Matrix.
-//              Nos temas coloridos, a cor de cada traço é indexada pelo valor do
-//              ruído local n (-1..1 → 0..1 → ramp cold→hot), quantizada em 8
-//              buckets (8 CGPaths por frame) para manter a performance.
+//              Nos temas coloridos, o tom é UNIFORME (ramp 0.6) e o destaque vem
+//              da velocidade de rotação do traço — a girar rápido sobe até ao
+//              stop quente. 8 buckets (8 CGPaths por frame) para performance.
 //   speed    — 0.25x..3x sobre o drift temporal do ruído (default 1x).
 //   count    — densidade da grelha 20..100 (default 57; regenera a grelha).
 //   length   — comprimento do traço 12..48 px (default 26).
@@ -195,9 +195,10 @@ public final class UltracodeLineRippleView: ScreenSaverView {
         }
         let stops = hexes.map(RGB.init)
         bucketColors = (0..<Self.bucketCount).map { b in
-            // só a metade clara da ramp (0.4..1): os stops frios são quase pretos
-            // e criavam zonas escuras a mover-se com o campo
-            let t = 0.4 + 0.6 * (CGFloat(b) + 0.5) / CGFloat(Self.bucketCount)
+            // bucket 0 = tom base uniforme (ramp 0.6, tom médio-claro visível);
+            // buckets seguintes sobem até ao stop mais quente — o destaque por
+            // velocidade de rotação acende os traços em movimento rápido
+            let t = 0.6 + 0.4 * CGFloat(b) / CGFloat(Self.bucketCount - 1)
             return ramp(t, stops: stops).color.cgColor
         }
     }
@@ -213,7 +214,7 @@ public final class UltracodeLineRippleView: ScreenSaverView {
         var x: Double
         var y: Double
         var angle: Double = 0
-        var n: Double = 0   // último valor do ruído local (-1..1) para a cor
+        var spd: Double = 0   // velocidade angular suavizada (EMA) para o destaque
     }
 
     private var noise = SimplexNoise2D(seed: 0.5)
@@ -303,8 +304,9 @@ public final class UltracodeLineRippleView: ScreenSaverView {
             var diff = target - p.angle
             while diff > Double.pi { diff -= 2 * Double.pi }
             while diff < -Double.pi { diff += 2 * Double.pi }
-            p.angle += diff * 0.12
-            p.n = n
+            let delta = diff * 0.12
+            p.angle += delta
+            p.spd = p.spd * 0.85 + abs(delta) * 0.15
 
             points[idx] = p
         }
@@ -337,13 +339,13 @@ public final class UltracodeLineRippleView: ScreenSaverView {
             return
         }
 
-        // Tema colorido: cor indexada pelo valor do ruído local
-        // (n de -1..1 → 0..1 → ramp cold→hot), agrupada em 8 buckets
+        // Tema colorido: tom base uniforme, destaque pela VELOCIDADE de rotação
+        // do traço (spd 0 → tom base; a girar rápido → stop quente). 8 buckets
         // (um CGPath por bucket) para manter a performance.
         let buckets = Self.bucketCount
         let paths = (0..<buckets).map { _ in CGMutablePath() }
         for p in points {
-            let t = min(max((p.n + 1) / 2, 0), 1)
+            let t = min(p.spd / 0.05, 1)
             let b = min(Int(t * Double(buckets)), buckets - 1)
             let ux = cos(p.angle) * half
             let uy = sin(p.angle) * half
