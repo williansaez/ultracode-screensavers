@@ -2,14 +2,14 @@ import ScreenSaver
 import AppKit
 
 // Réplica fiel do componente web "line-ripple-background" (originkit.dev, preset `base`).
-// Grelha de segmentos curtos orientados por ruído simplex 2D com drift temporal;
-// um "cursor" autónomo (Lissajous com rajadas de velocidade) dobra e empurra os
-// segmentos com exatamente a mesma física do original (mousemove → substituído).
+// Grelha de segmentos curtos orientados por ruído simplex 2D com drift temporal.
+// Sem cursor: o campo corre puro (a física de mousemove da referência foi removida
+// a pedido — só o estado "idle" do componente).
 //
 // Parâmetros portados 1:1 do preset:
 //   count = 57  → gap = 90 - ((57-1)/99)*82 ≈ 43.62 px
 //   movement = 24 → drift = t(ms) * 24 * 8e-6
-//   force = 4, resolution = 10 → comprimento do traço = 6 + (10/10)*20 = 26 px
+//   resolution = 10 → comprimento do traço = 6 + (10/10)*20 = 26 px
 //   strokeColor #FFFFFF, backgroundColor #000000, stroke-width 1.5, linecap round
 //   CURL = 3, BASE_ANGLE = 0, SEED = 0.5, easing do ângulo 0.12/frame @60fps
 
@@ -95,7 +95,6 @@ public final class UltracodeLineRippleView: ScreenSaverView {
     private let backgroundColor = NSColor(srgbRed: 0, green: 0, blue: 0, alpha: 1)
     private let count = 57.0
     private let movement = 24.0
-    private let force = 4.0
     private let resolution = 10.0
     private let curl = 3.0
     private let baseAngle = 0.0
@@ -104,25 +103,11 @@ public final class UltracodeLineRippleView: ScreenSaverView {
         var x: Double
         var y: Double
         var angle: Double = 0
-        var cx: Double = 0   // cursor.x (deslocamento)
-        var cy: Double = 0
-        var cvx: Double = 0  // cursor.vx
-        var cvy: Double = 0
-    }
-
-    private struct Mouse {
-        var x = -10.0, y = 0.0
-        var lx = 0.0, ly = 0.0
-        var sx = 0.0, sy = 0.0
-        var vs = 0.0
-        var set = false
     }
 
     private var noise = SimplexNoise2D(seed: 0.5)
     private var points: [Point] = []
-    private var mouse = Mouse()
     private var timeMs: Double = 0
-    private var lissajousPhase: Double = 0
     private var builtSize: CGSize = .zero
 
     public override init?(frame: NSRect, isPreview: Bool) {
@@ -166,47 +151,11 @@ public final class UltracodeLineRippleView: ScreenSaverView {
         }
     }
 
-    // MARK: cursor autónomo (substitui mousemove)
-
-    // Lissajous com envelope de velocidade: períodos lentos + rajadas rápidas,
-    // imitando o gesto humano que dá origem aos "ripples" na referência.
-    private func updateAutonomousMouse(dt: Double) {
-        let w = Double(bounds.width), h = Double(bounds.height)
-        let t = timeMs / 1000.0
-        // rajadas: fator de velocidade 0.35 … ~2.9 (ciclo ~57 s)
-        let burst = 0.35 + 2.5 * pow(0.5 + 0.5 * sin(t * 0.11), 3)
-        lissajousPhase += burst * dt
-        let px = w * (0.5 + 0.40 * sin(lissajousPhase * 0.90 + 0.7))
-        let py = h * (0.5 + 0.38 * sin(lissajousPhase * 1.30))
-        mouse.x = px
-        mouse.y = py
-        if !mouse.set {
-            mouse.sx = px; mouse.sy = py
-            mouse.lx = px; mouse.ly = py
-            mouse.set = true
-        }
-    }
-
-    // MARK: tick (porte de movePoints + suavização do rato)
+    // MARK: tick (porte de movePoints)
 
     public override func animateOneFrame() {
         rebuildPointsIfNeeded()
-        let dt = 1.0 / 60.0
-        timeMs += dt * 1000.0
-
-        updateAutonomousMouse(dt: dt)
-
-        // suavização exatamente como no tick original
-        mouse.sx += (mouse.x - mouse.sx) * 0.1
-        mouse.sy += (mouse.y - mouse.sy) * 0.1
-        let mdx = mouse.x - mouse.lx
-        let mdy = mouse.y - mouse.ly
-        let md = (mdx * mdx + mdy * mdy).squareRoot()
-        mouse.vs += (md - mouse.vs) * 0.1
-        mouse.vs = min(100, mouse.vs)
-        mouse.lx = mouse.x
-        mouse.ly = mouse.y
-
+        timeMs += 1000.0 / 60.0
         movePoints(time: timeMs)
         needsDisplay = true
     }
@@ -221,37 +170,10 @@ public final class UltracodeLineRippleView: ScreenSaverView {
             let n = noise.noise(p.x * 0.004 - dirX, p.y * 0.004 - dirY)
             let target = baseAngle + n * Double.pi * curl
 
-            let dx = p.x - mouse.sx
-            let dy = p.y - mouse.sy
-            let d = (dx * dx + dy * dy).squareRoot()
-            let l = max(175.0, mouse.vs)
-            var bend = 0.0
-            if d < l {  // hover = true no preset
-                let s = 1 - d / l
-                let influence = (force / 10) * 0.02
-                let tangent = atan2(dy, dx) + Double.pi / 2
-                bend = (tangent - target) * s * (0.4 + mouse.vs * influence)
-
-                let f = cos(d * 0.001) * s
-                let push = (force / 10) * 7e-4
-                let ang = atan2(dy, dx)
-                p.cvx += cos(ang) * f * l * mouse.vs * push
-                p.cvy += sin(ang) * f * l * mouse.vs * push
-            }
-
-            var diff = target + bend - p.angle
+            var diff = target - p.angle
             while diff > Double.pi { diff -= 2 * Double.pi }
             while diff < -Double.pi { diff += 2 * Double.pi }
             p.angle += diff * 0.12
-
-            p.cvx += (0 - p.cx) * 0.01
-            p.cvy += (0 - p.cy) * 0.01
-            p.cvx *= 0.95
-            p.cvy *= 0.95
-            p.cx += p.cvx
-            p.cy += p.cvy
-            p.cx = min(50, max(-50, p.cx))
-            p.cy = min(50, max(-50, p.cy))
 
             points[idx] = p
         }
@@ -272,12 +194,10 @@ public final class UltracodeLineRippleView: ScreenSaverView {
 
         let path = CGMutablePath()
         for p in points {
-            let cx = p.x + p.cx
-            let cy = p.y + p.cy
             let ux = cos(p.angle) * half
             let uy = sin(p.angle) * half
-            path.move(to: CGPoint(x: cx - ux, y: cy - uy))
-            path.addLine(to: CGPoint(x: cx + ux, y: cy + uy))
+            path.move(to: CGPoint(x: p.x - ux, y: p.y - uy))
+            path.addLine(to: CGPoint(x: p.x + ux, y: p.y + uy))
         }
         ctx.addPath(path)
         ctx.strokePath()
