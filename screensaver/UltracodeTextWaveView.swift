@@ -91,6 +91,26 @@ final class UltracodeTextWaveView: ScreenSaverView {
     override var hasConfigureSheet: Bool { false }
     override var configureSheet: NSWindow? { nil }
 
+    // MARK: - Ruído (jitter de fase; torna o movimento menos regular)
+
+    private static func hash(_ x: Int, _ y: Int) -> Double {
+        var h = UInt64(bitPattern: Int64(x)) &* 0x9E3779B97F4A7C15
+        h ^= UInt64(bitPattern: Int64(y)) &* 0xC2B2AE3D27D4EB4F
+        h = (h ^ (h >> 31)) &* 0xD6E8FEB86659FD93
+        h ^= h >> 32
+        return Double(h % 100_000) / 50_000.0 - 1.0
+    }
+
+    private static func valueNoise(_ x: Double, _ y: Double) -> Double {
+        let xf = floor(x), yf = floor(y)
+        let xi = Int(xf), yi = Int(yf)
+        let fx = x - xf, fy = y - yf
+        let sx = fx * fx * (3 - 2 * fx), sy = fy * fy * (3 - 2 * fy)
+        let a = hash(xi, yi), b = hash(xi + 1, yi)
+        let c = hash(xi, yi + 1), d = hash(xi + 1, yi + 1)
+        return a + (b - a) * sx + (c - a) * sy + (a - b - c + d) * sx * sy
+    }
+
     // MARK: - Desenho
 
     override func draw(_ rect: NSRect) {
@@ -131,10 +151,14 @@ final class UltracodeTextWaveView: ScreenSaverView {
             let xRatio = Double((i + 1) % cols) / Double(cols + 1)
             let yRatio = Double(rows - row) / Double(rows)
 
-            // --l = sin(absX / cos(sin(absY*2+60)*2.5) * 3 - t*sf/350)
+            // --l = sin(absX / cos(sin(absY*2+60)*2.5) * 3 - t*sf/350) + jitter de ruído:
+            // campo de value noise a fluir perturba a fase (±2.2 rad) e parte as
+            // bandas simétricas em manchas orgânicas.
             let absX = abs(xRatio - 0.5)
             let absY = abs(yRatio - 0.5)
-            let l = sin(absX / cos(sin(absY * 2 + 60) * 2.5) * 3 - phase)
+            let jitter = Self.valueNoise(Double(col) * 0.12 + time * 3.0e-5,
+                                         Double(row) * 0.12 + time * 2.2e-5) * 2.2
+            let l = sin(absX / cos(sin(absY * 2 + 60) * 2.5) * 3 - phase + jitter)
             let opacity = max(l, 0.05)
 
             guard let glyph = glyphCache[textChars[i % textLen]] else { continue }
