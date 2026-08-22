@@ -2,6 +2,10 @@ import ScreenSaver
 import AppKit
 import simd
 
+private extension Notification.Name {
+    static let dotMatrixConfigChanged = Notification.Name("UltracodeDotMatrixConfigChanged")
+}
+
 // UltracodeDotMatrix — réplica fiel do componente web "dotmatrix" do
 // originkit.dev (preset `base`). Referência: refs/dotmatrix/source_1.tsx.
 //
@@ -34,9 +38,7 @@ final class UltracodeDotMatrixView: ScreenSaverView {
 
     private let uFrequency: Float = 0.3
     private let uSpeed: Float = 0.3
-    private let uCellSizeDevice: CGFloat = 16.363636363636363
     private let uGamma: Float = 1.6842105263157894
-    private let uPaletteBias: Float = 0.5
 
     // DEFAULT_COLORS = ["#FFFFFF", "#E07000", "#000000"], alfas 1
     private let palette: [SIMD3<Float>] = [
@@ -45,25 +47,124 @@ final class UltracodeDotMatrixView: ScreenSaverView {
         SIMD3<Float>(0, 0, 0),
     ]
 
+    // MARK: temas
+    //
+    // Tema 0 ("Base") mantém a cadeia branco→#E07000→preto exata do shader.
+    // Os restantes usam as MESMAS ramps de 8 stops (cold→hot) do Jogo da
+    // Vida; como na cadeia base g2 = 0 é o stop mais "aceso" (branco) e
+    // g2 = 1 o mais escuro (preto), a ramp é indexada invertida (1 - g2)
+    // para preservar o contraste: dots mais acesos = stops quentes.
+
+    private struct Theme {
+        let name: String
+        let stops: [UInt32]   // cold -> hot (vazio = cadeia base)
+    }
+
+    private static let themes: [Theme] = [
+        Theme(name: "Base (laranja)", stops: []),
+        Theme(name: "Ultracode (lavanda)", stops: [
+            0x34313A, 0x3D3946, 0x56506B, 0x6F6590,
+            0x9C8FD0, 0xB9AEE8, 0xCFC6F2, 0xEEE9FB,
+        ]),
+        Theme(name: "Doom clássico", stops: [
+            0x3A322C, 0x571B08, 0x9F2A00, 0xD75F07,
+            0xF0A039, 0xFAD75C, 0xFFF3A0, 0xFFFFE6,
+        ]),
+        Theme(name: "Matrix", stops: [
+            0x303A33, 0x2F4D33, 0x2F6B3A, 0x32934A,
+            0x3FBF5F, 0x73E08C, 0xB6F2C2, 0xEFFFF2,
+        ]),
+    ]
+
+    private static func stopsToSIMD(_ stops: [UInt32]) -> [SIMD3<Float>] {
+        stops.map { hex in
+            SIMD3<Float>(Float((hex >> 16) & 0xFF) / 255,
+                         Float((hex >> 8) & 0xFF) / 255,
+                         Float(hex & 0xFF) / 255)
+        }
+    }
+
+    /// Interpolação linear ao longo dos 8 stops (t em [0, 1]).
+    private static func ramp(_ t: Float, stops: [SIMD3<Float>]) -> SIMD3<Float> {
+        let x = min(max(t, 0), 1) * Float(stops.count - 1)
+        let i = min(Int(x), stops.count - 2)
+        return mix(stops[i], stops[i + 1], t: x - Float(i))
+    }
+
+    // MARK: configuração do utilizador
+
+    private struct Config {
+        var theme = 0
+        var speed: Double = 1.0           // multiplicador 0.25x–3x do z do ruído
+        var cellSize: Double = 16.363636363636363  // px físicos, 10–32
+        var paletteBias: Double = 0.5     // 0.0–0.8
+    }
+
+    private static let moduleName = "com.williansaez.ultracode-dotmatrix"
+
+    private static func makeDefaults() -> ScreenSaverDefaults? {
+        let d = ScreenSaverDefaults(forModuleWithName: moduleName)
+        d?.register(defaults: [
+            "theme": 0,
+            "speed": 1.0,
+            "cellSize": 16.363636363636363,
+            "paletteBias": 0.5,
+        ])
+        return d
+    }
+
+    private var config = Config()
+    private var themeStops: [SIMD3<Float>] = []  // vazio = cadeia base
+
+    private func loadConfig() {
+        guard let d = Self.makeDefaults() else { return }
+        config.theme = min(max(d.integer(forKey: "theme"), 0), Self.themes.count - 1)
+        config.speed = min(max(d.double(forKey: "speed"), 0.25), 3.0)
+        config.cellSize = min(max(d.double(forKey: "cellSize"), 10.0), 32.0)
+        config.paletteBias = min(max(d.double(forKey: "paletteBias"), 0.0), 0.8)
+        themeStops = Self.stopsToSIMD(Self.themes[config.theme].stops)
+    }
+
     private var time: Float = 0  // segundos, espelha uTime = rAF ms * 0.001
 
     // MARK: ciclo de vida
 
     override init?(frame: NSRect, isPreview: Bool) {
         super.init(frame: frame, isPreview: isPreview)
-        animationTimeInterval = 1.0 / 30.0
+        commonInit()
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
-        animationTimeInterval = 1.0 / 30.0
+        commonInit()
     }
 
-    override var hasConfigureSheet: Bool { false }
-    override var configureSheet: NSWindow? { nil }
+    private func commonInit() {
+        animationTimeInterval = 1.0 / 30.0
+        loadConfig()
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(configChanged),
+            name: .dotMatrixConfigChanged, object: nil)
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+
+    @objc private func configChanged() {
+        loadConfig()
+        needsDisplay = true
+    }
+
+    override func startAnimation() {
+        loadConfig()
+        super.startAnimation()
+    }
 
     override func animateOneFrame() {
-        time += Float(animationTimeInterval)
+        // O multiplicador de velocidade escala o avanço do tempo acumulado,
+        // por isso mudar a velocidade não salta no campo de ruído.
+        time += Float(animationTimeInterval * config.speed)
         needsDisplay = true
     }
 
@@ -83,7 +184,9 @@ final class UltracodeDotMatrixView: ScreenSaverView {
         // usa dpr = min(devicePixelRatio, 2). Converter para pontos preserva a
         // densidade visual do browser no mesmo ecrã.
         let dpr = min(window?.backingScaleFactor ?? 1, 2)
-        let cell = max(uCellSizeDevice / dpr, 1)
+        let cell = max(CGFloat(config.cellSize) / dpr, 1)
+        let uPaletteBias = Float(config.paletteBias)
+        let stops = themeStops  // vazio = cadeia base branco→laranja→preto
 
         let cols = Int(ceil(w / cell))
         let rows = Int(ceil(h / cell))
@@ -117,17 +220,130 @@ final class UltracodeDotMatrixView: ScreenSaverView {
                 let radius = CGFloat(g2) * 0.5 * cell
                 if radius <= 0 { continue }
 
-                // interpolação da paleta de 3 cores (cadeia mix do shader)
-                let scaled = g2 * 2                          // g2 * (cnt - 1)
-                let i0 = min(max(Int(floor(scaled)), 0), 1)  // clamp(i0, 0, cnt-2)
-                let f = scaled - Float(i0)
-                let c = mix(palette[i0], palette[i0 + 1], t: f)
+                let c: SIMD3<Float>
+                if stops.isEmpty {
+                    // interpolação da paleta de 3 cores (cadeia mix do shader)
+                    let scaled = g2 * 2                          // g2 * (cnt - 1)
+                    let i0 = min(max(Int(floor(scaled)), 0), 1)  // clamp(i0, 0, cnt-2)
+                    let f = scaled - Float(i0)
+                    c = mix(palette[i0], palette[i0 + 1], t: f)
+                } else {
+                    // ramp de 8 stops (cold→hot) indexada invertida: na cadeia
+                    // base g2 = 0 é o stop mais aceso, por isso 1 - g2 mapeia
+                    // os dots mais acesos para os stops quentes do tema.
+                    c = Self.ramp(1 - g2, stops: stops)
+                }
 
                 ctx.setFillColor(CGColor(red: CGFloat(c.x), green: CGFloat(c.y),
                                          blue: CGFloat(c.z), alpha: 1))
                 ctx.fillEllipse(in: CGRect(x: cx - radius, y: cy - radius,
                                            width: radius * 2, height: radius * 2))
             }
+        }
+    }
+
+    // MARK: folha de configuração
+
+    private var sheet: NSPanel?
+    private var themePopup: NSPopUpButton?
+    private var speedSlider: NSSlider?
+    private var cellSlider: NSSlider?
+    private var biasSlider: NSSlider?
+
+    override var hasConfigureSheet: Bool { true }
+
+    override var configureSheet: NSWindow? {
+        if let sheet { return sheet }
+        loadConfig()
+
+        // Frames fixos, zero Auto Layout: a folha é medida e apresentada
+        // remotamente (legacyScreenSaver -> Definições do Sistema) antes de
+        // qualquer passagem de layout; painéis com autolayout colapsam lá.
+        let W: CGFloat = 440, H: CGFloat = 212
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: W, height: H),
+                            styleMask: [.titled],
+                            backing: .buffered, defer: false)
+        panel.title = "Matriz de Pontos"
+        panel.isReleasedWhenClosed = false
+
+        let content = panel.contentView!
+
+        func label(_ text: String, row y: CGFloat) -> NSTextField {
+            let l = NSTextField(labelWithString: text)
+            l.alignment = .right
+            l.frame = NSRect(x: 20, y: y, width: 150, height: 20)
+            content.addSubview(l)
+            return l
+        }
+        func slider(_ value: Double, _ minV: Double, _ maxV: Double,
+                    row y: CGFloat) -> NSSlider {
+            let s = NSSlider(value: value, minValue: minV, maxValue: maxV,
+                             target: nil, action: nil)
+            s.isContinuous = false
+            s.frame = NSRect(x: 180, y: y - 2, width: 240, height: 24)
+            content.addSubview(s)
+            return s
+        }
+
+        _ = label("Tema:", row: 164)
+        let popup = NSPopUpButton(frame: NSRect(x: 178, y: 158, width: 244, height: 26),
+                                  pullsDown: false)
+        popup.addItems(withTitles: Self.themes.map(\.name))
+        popup.selectItem(at: config.theme)
+        content.addSubview(popup)
+
+        _ = label("Velocidade:", row: 126)
+        let sSlider = slider(config.speed, 0.25, 3.0, row: 126)
+        _ = label("Tamanho da célula:", row: 88)
+        let cSlider = slider(config.cellSize, 10.0, 32.0, row: 88)
+        _ = label("Contraste da paleta:", row: 50)
+        let bSlider = slider(config.paletteBias, 0.0, 0.8, row: 50)
+
+        let cancel = NSButton(title: "Cancelar", target: self,
+                              action: #selector(sheetCancel(_:)))
+        cancel.bezelStyle = .rounded
+        cancel.frame = NSRect(x: W - 200, y: 12, width: 90, height: 30)
+        content.addSubview(cancel)
+
+        let ok = NSButton(title: "OK", target: self,
+                          action: #selector(sheetOK(_:)))
+        ok.bezelStyle = .rounded
+        ok.keyEquivalent = "\r"
+        ok.frame = NSRect(x: W - 102, y: 12, width: 82, height: 30)
+        content.addSubview(ok)
+
+        content.layoutSubtreeIfNeeded()
+
+        sheet = panel
+        themePopup = popup
+        speedSlider = sSlider
+        cellSlider = cSlider
+        biasSlider = bSlider
+        return panel
+    }
+
+    @objc private func sheetOK(_ sender: Any?) {
+        if let d = Self.makeDefaults() {
+            d.set(themePopup?.indexOfSelectedItem ?? 0, forKey: "theme")
+            d.set(speedSlider?.doubleValue ?? 1.0, forKey: "speed")
+            d.set(cellSlider?.doubleValue ?? 16.363636363636363, forKey: "cellSize")
+            d.set(biasSlider?.doubleValue ?? 0.5, forKey: "paletteBias")
+            d.synchronize()
+        }
+        NotificationCenter.default.post(name: .dotMatrixConfigChanged, object: nil)
+        closeSheet()
+    }
+
+    @objc private func sheetCancel(_ sender: Any?) {
+        closeSheet()
+    }
+
+    private func closeSheet() {
+        guard let sheet else { return }
+        if let parent = sheet.sheetParent {
+            parent.endSheet(sheet)
+        } else {
+            sheet.close()
         }
     }
 
