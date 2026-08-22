@@ -46,6 +46,10 @@ public final class UltracodeCPUView: ScreenSaverView {
             0x303A33, 0x2F4D33, 0x2F6B3A, 0x32934A,
             0x3FBF5F, 0x73E08C, 0xB6F2C2, 0xEFFFF2,
         ]),
+        Theme(name: "Mono", stops: [
+            0x141414, 0x2A2A2A, 0x454545, 0x656565,
+            0x8A8A8A, 0xB4B4B4, 0xDCDCDC, 0xFFFFFF,
+        ]),
     ]
 
     private let bgTop = RGB(0x232126)
