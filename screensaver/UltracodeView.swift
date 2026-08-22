@@ -84,7 +84,7 @@ public final class UltracodeView: ScreenSaverView {
             "theme": 0,
             "flameHeight": 0.60,
             "intensity": 1.0,
-            "floorLevel": 0.10,
+            "floorLevel": 0.08,
             "pitch": 26.0,
             "fps": 30.0,
             "bloom": true,

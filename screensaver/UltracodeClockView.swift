@@ -80,7 +80,7 @@ public final class UltracodeClockView: ScreenSaverView {
             "pitch": 26.0,
             "fps": 30.0,
             "bloom": true,
-            "floorLevel": 0.10,
+            "floorLevel": 0.18,
         ])
         return d
     }

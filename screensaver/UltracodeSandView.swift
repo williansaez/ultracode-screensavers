@@ -79,8 +79,8 @@ public final class UltracodeSandView: ScreenSaverView {
             "theme": 0,
             "pitch": 26.0,
             "fps": 30.0,
-            "bloom": true,
-            "floorLevel": 0.10,
+            "bloom": false,
+            "floorLevel": 0.08,
         ])
         return d
     }

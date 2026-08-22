@@ -80,7 +80,7 @@ public final class UltracodeLifeView: ScreenSaverView {
             "pitch": 26.0,
             "fps": 10.0,
             "bloom": true,
-            "floorLevel": 0.10,
+            "floorLevel": 0.12,
         ])
         return d
     }

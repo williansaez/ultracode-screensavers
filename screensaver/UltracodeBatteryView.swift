@@ -70,7 +70,7 @@ public final class UltracodeBatteryView: ScreenSaverView {
         d?.register(defaults: [
             "pitch": 26.0,
             "fps": 30.0,
-            "floorLevel": 0.10,
+            "floorLevel": 0.25,
             "bloom": true,
         ])
         return d

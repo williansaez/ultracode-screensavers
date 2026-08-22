@@ -79,7 +79,7 @@ public final class UltracodeBoidsView: ScreenSaverView {
             "theme": 0,
             "pitch": 26.0,
             "fps": 30.0,
-            "floorLevel": 0.10,
+            "floorLevel": 0.03,
             "bloom": true,
         ])
         return d

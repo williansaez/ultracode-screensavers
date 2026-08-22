@@ -27,7 +27,9 @@ Painel de **Opções…** partilhado nas Definições de Proteção de Ecrã:
 
 Cada réplica tem a sua folha de opções: **Tema** (Base = visual original · Lavanda · Doom · Matrix — a Matriz de Pontos tem também Mono), **Velocidade** (0.25×–3×) e extras próprios (indicados em cada saver abaixo). Nos temas coloridos o tom é uniforme; quando há destaque, vem da dinâmica (ex.: velocidade de rotação), nunca de gradientes espaciais.
 
-> **Capturas deste README**: 1280×800, tudo a preto e branco — tema **Mono** na suite ultracode, **Base** nas réplicas (Matriz de Pontos em Mono) — e **todos os parâmetros a meio da escala** dos respetivos sliders. Única exceção: a Bateria mantém as cores semânticas de estado.
+> **Capturas deste README**: 1280×800, tudo a preto e branco — tema **Mono** na suite ultracode, **Base** nas réplicas (Matriz de Pontos em Mono) — com os **defaults de fábrica**, incluindo o brilho de fundo e bloom curados por saver (tabela em baixo). Única exceção: a Bateria mantém as cores semânticas de estado.
+
+Brilho do fundo de fábrica por saver (0–0.30): Relâmpagos 0 · Rede/Boids 0.03 · Bolor/Gray-Scott/Átomo 0.05 · Fogo/Areia 0.08 · Pong 0.10 · Vida/Labirinto 0.12 · CPU/Snake 0.15 · Relógio 0.18 · Bateria 0.25. Bloom ligado em todos exceto Areia. Regra: floor alto quando a grelha vazia faz parte da leitura (recipiente, tabuleiro, display); escuro quando o efeito vive do contraste.
 
 ## Suite ultracode
 
