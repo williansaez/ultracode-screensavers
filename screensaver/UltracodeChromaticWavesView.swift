@@ -19,7 +19,10 @@
 //   colors     = ["#FFFFFF"] (1 cor, alpha 1)  bgColor = #000000  uValue = 1
 //   frame cap  = 30 fps (frameInterval = 1000/30 no original)
 //
-// Sem configureSheet. Sem dependências externas: ScreenSaver, AppKit, Metal, QuartzCore, simd.
+// configureSheet (frames fixos, sem Auto Layout): tema (Base/Ultracode/Doom/Matrix),
+// velocidade (0.25x–3x sobre uSpeed), tamanho de célula (12–48 px) e frequência (0.1–1.0).
+// Defaults em ScreenSaverDefaults "com.williansaez.ultracode-chromatic-waves".
+// Sem dependências externas: ScreenSaver, AppKit, Metal, QuartzCore, simd.
 
 import ScreenSaver
 import AppKit
@@ -39,6 +42,11 @@ struct Uniforms {
     float  cellSize;     // 24 (pixels de dispositivo, como no WebGL com dpr)
     float  gamma;        // 2.4736842
     float  paletteBias;  // -0.15
+    int    themeMode;    // 0 = Base (branco), >0 = ramp de 8 stops
+    float  pad0;
+    float  pad1;
+    float  pad2;
+    float4 stops[8];     // ramp cold -> hot (rgb em .xyz)
 };
 
 struct VOut { float4 pos [[position]]; };
@@ -134,10 +142,18 @@ fragment float4 cw_fragment(VOut in [[stage_in]], constant Uniforms &u [[buffer(
     float aa = fwidth(dist) + 1e-4;
     float mark = 1.0 - smoothstep(radius - aa, radius + aa, dist);
 
-    // Paleta do preset: 1 cor (#FFFFFF, alpha 1) → dotCol = branco, dotOpacity = 1.
-    // Composição source-over sobre bgColor (#000000), como o canvas alpha sobre a div.
+    // Paleta: tema 0 (Base) = branco fixo, como o preset original.
+    // Temas >0: a luminância pós-gama (com bias) indexa a ramp de 8 stops cold->hot.
     float a = mark;                    // mark * dotOpacity
-    float3 dotCol = float3(1.0);
+    float3 dotCol;
+    if (u.themeMode == 0) {
+        dotCol = float3(1.0);
+    } else {
+        float t = clamp(gray + u.paletteBias, 0.0, 1.0);
+        float x = t * 7.0;
+        int i = clamp(int(x), 0, 6);
+        dotCol = mix(u.stops[i].rgb, u.stops[i + 1].rgb, x - float(i));
+    }
     float3 bg = float3(0.0);
     float3 outColor = dotCol * a + bg * (1.0 - a);
     return float4(outColor, 1.0);
@@ -152,17 +168,89 @@ private struct Uniforms {
     var cellSize: Float
     var gamma: Float
     var paletteBias: Float
+    var themeMode: Int32
+    var pad0: Float = 0
+    var pad1: Float = 0
+    var pad2: Float = 0
+    var stops: (SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>,
+                SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>)
 }
 
 @objc(UltracodeChromaticWavesView)
 public final class UltracodeChromaticWavesView: ScreenSaverView {
 
     // Parâmetros portados do preset `base` (já mapeados UI → shader)
-    private let uFrequency: Float = 0.3
     private let uSpeed: Float = 0.2
-    private let uCellSize: Float = 24.0
     private let uGamma: Float = 0.5 + ((6.0 - 1.0) / (20.0 - 1.0)) * (8.0 - 0.5)  // 2.4736842
     private let uPaletteBias: Float = -0.15
+
+    // MARK: - Temas
+
+    private struct Theme {
+        let name: String
+        let stops: [UInt32]   // cold -> hot (8 stops); vazio = branco fixo (Base)
+    }
+
+    private static let themes: [Theme] = [
+        Theme(name: "Base", stops: []),
+        Theme(name: "Ultracode (lavanda)", stops: [
+            0x34313A, 0x3D3946, 0x56506B, 0x6F6590,
+            0x9C8FD0, 0xB9AEE8, 0xCFC6F2, 0xEEE9FB,
+        ]),
+        Theme(name: "Doom clássico", stops: [
+            0x3A322C, 0x571B08, 0x9F2A00, 0xD75F07,
+            0xF0A039, 0xFAD75C, 0xFFF3A0, 0xFFFFE6,
+        ]),
+        Theme(name: "Matrix", stops: [
+            0x303A33, 0x2F4D33, 0x2F6B3A, 0x32934A,
+            0x3FBF5F, 0x73E08C, 0xB6F2C2, 0xEFFFF2,
+        ]),
+    ]
+
+    private static func stopVec(_ hex: UInt32) -> SIMD4<Float> {
+        SIMD4<Float>(Float((hex >> 16) & 0xFF) / 255,
+                     Float((hex >> 8) & 0xFF) / 255,
+                     Float(hex & 0xFF) / 255, 1)
+    }
+
+    // MARK: - Configuração do utilizador
+
+    private struct Config {
+        var theme = 0
+        var speedMult: Double = 1.0     // 0.25x .. 3x
+        var cellSize: Double = 24.0     // 12 .. 48 px
+        var frequency: Double = 0.3     // 0.1 .. 1.0
+    }
+
+    private static let moduleName = "com.williansaez.ultracode-chromatic-waves"
+
+    private static func makeDefaults() -> ScreenSaverDefaults? {
+        let d = ScreenSaverDefaults(forModuleWithName: moduleName)
+        d?.register(defaults: [
+            "theme": 0,
+            "speedMult": 1.0,
+            "cellSize": 24.0,
+            "frequency": 0.3,
+        ])
+        return d
+    }
+
+    private var config = Config()
+
+    private func loadConfig() {
+        guard let d = Self.makeDefaults() else { return }
+        config.theme = min(max(d.integer(forKey: "theme"), 0), Self.themes.count - 1)
+        config.speedMult = min(max(d.double(forKey: "speedMult"), 0.25), 3.0)
+        config.cellSize = min(max(d.double(forKey: "cellSize"), 12.0), 48.0)
+        config.frequency = min(max(d.double(forKey: "frequency"), 0.1), 1.0)
+    }
+
+    // Sheet de configuração
+    private var sheet: NSPanel?
+    private var themePopup: NSPopUpButton?
+    private var speedSlider: NSSlider?
+    private var cellSlider: NSSlider?
+    private var freqSlider: NSSlider?
 
     private var device: MTLDevice?
     private var commandQueue: MTLCommandQueue?
@@ -188,11 +276,9 @@ public final class UltracodeChromaticWavesView: ScreenSaverView {
     private func commonInit() {
         animationTimeInterval = 1.0 / 30.0
         wantsLayer = true
+        loadConfig()
         setupMetal()
     }
-
-    public override var hasConfigureSheet: Bool { false }
-    public override var configureSheet: NSWindow? { nil }
 
     // MARK: - Metal setup
 
@@ -254,6 +340,7 @@ public final class UltracodeChromaticWavesView: ScreenSaverView {
 
     public override func startAnimation() {
         super.startAnimation()
+        loadConfig()
         attachLayerIfNeeded()
     }
 
@@ -289,19 +376,126 @@ public final class UltracodeChromaticWavesView: ScreenSaverView {
         pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
         pass.colorAttachments[0].storeAction = .store
         guard let enc = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else { return }
+        let theme = Self.themes[min(max(config.theme, 0), Self.themes.count - 1)]
+        let s: [SIMD4<Float>] = theme.stops.isEmpty
+            ? Array(repeating: SIMD4<Float>(1, 1, 1, 1), count: 8)
+            : theme.stops.map(Self.stopVec)
         var uniforms = Uniforms(
             resolution: SIMD2<Float>(Float(texture.width), Float(texture.height)),
             time: simTime,
-            frequency: uFrequency,
-            speed: uSpeed,
-            cellSize: uCellSize,
+            frequency: Float(config.frequency),
+            speed: uSpeed * Float(config.speedMult),
+            cellSize: Float(config.cellSize),
             gamma: uGamma,
-            paletteBias: uPaletteBias
+            paletteBias: uPaletteBias,
+            themeMode: theme.stops.isEmpty ? 0 : 1,
+            stops: (s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7])
         )
         enc.setRenderPipelineState(pipeline)
         enc.setFragmentBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 0)
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         enc.endEncoding()
+    }
+
+    // MARK: - Configure sheet
+    //
+    // REGRA do projeto: frames fixos, zero Auto Layout — o sheet é medido e
+    // apresentado remotamente (legacyScreenSaver -> Definições de Sistema)
+    // antes de qualquer passe de layout; painéis com autolayout colapsam lá.
+
+    public override var hasConfigureSheet: Bool { true }
+
+    public override var configureSheet: NSWindow? {
+        if let sheet { return sheet }
+        loadConfig()
+
+        let W: CGFloat = 440, H: CGFloat = 212
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: W, height: H),
+                            styleMask: [.titled],
+                            backing: .buffered, defer: false)
+        panel.title = "Ondas Cromáticas"
+        panel.isReleasedWhenClosed = false
+
+        let content = panel.contentView!
+
+        func label(_ text: String, row y: CGFloat) {
+            let l = NSTextField(labelWithString: text)
+            l.alignment = .right
+            l.frame = NSRect(x: 20, y: y, width: 150, height: 20)
+            content.addSubview(l)
+        }
+        func slider(_ value: Double, _ minV: Double, _ maxV: Double,
+                    row y: CGFloat) -> NSSlider {
+            let s = NSSlider(value: value, minValue: minV, maxValue: maxV,
+                             target: nil, action: nil)
+            s.isContinuous = false
+            s.frame = NSRect(x: 180, y: y - 2, width: 240, height: 24)
+            content.addSubview(s)
+            return s
+        }
+
+        label("Tema:", row: 164)
+        let popup = NSPopUpButton(frame: NSRect(x: 178, y: 158, width: 244, height: 26),
+                                  pullsDown: false)
+        popup.addItems(withTitles: Self.themes.map(\.name))
+        popup.selectItem(at: config.theme)
+        content.addSubview(popup)
+
+        label("Velocidade:", row: 126)
+        let sSlider = slider(config.speedMult, 0.25, 3.0, row: 126)
+
+        label("Tamanho da célula (px):", row: 88)
+        let cSlider = slider(config.cellSize, 12.0, 48.0, row: 88)
+
+        label("Frequência:", row: 50)
+        let fSlider = slider(config.frequency, 0.1, 1.0, row: 50)
+
+        let cancel = NSButton(title: "Cancelar", target: self,
+                              action: #selector(sheetCancel(_:)))
+        cancel.bezelStyle = .rounded
+        cancel.frame = NSRect(x: W - 200, y: 12, width: 90, height: 30)
+        content.addSubview(cancel)
+
+        let ok = NSButton(title: "OK", target: self,
+                          action: #selector(sheetOK(_:)))
+        ok.bezelStyle = .rounded
+        ok.keyEquivalent = "\r"
+        ok.frame = NSRect(x: W - 102, y: 12, width: 82, height: 30)
+        content.addSubview(ok)
+
+        content.layoutSubtreeIfNeeded()
+
+        sheet = panel
+        themePopup = popup
+        speedSlider = sSlider
+        cellSlider = cSlider
+        freqSlider = fSlider
+        return panel
+    }
+
+    @objc private func sheetOK(_ sender: Any?) {
+        if let d = Self.makeDefaults() {
+            d.set(themePopup?.indexOfSelectedItem ?? 0, forKey: "theme")
+            d.set(speedSlider?.doubleValue ?? 1.0, forKey: "speedMult")
+            d.set(cellSlider?.doubleValue ?? 24.0, forKey: "cellSize")
+            d.set(freqSlider?.doubleValue ?? 0.3, forKey: "frequency")
+            d.synchronize()
+        }
+        loadConfig()
+        closeSheet()
+    }
+
+    @objc private func sheetCancel(_ sender: Any?) {
+        closeSheet()
+    }
+
+    private func closeSheet() {
+        guard let sheet else { return }
+        if let parent = sheet.sheetParent {
+            parent.endSheet(sheet)
+        } else {
+            sheet.close()
+        }
     }
 
     // MARK: - Captura offscreen (verificação / harness)
