@@ -8,7 +8,7 @@
 //   colors = branco a 100%, 80% e 60% de alpha, ciclado por índice
 //   appearFrom = "middle" (delay = distância euclidiana ao centro)
 //   transition = tween 0.8 s, ease "easeOut" = cubic-bezier(0, 0, 0.58, 1)
-//   card: fundo #000000, borda 1 px #27272a, raio 25
+//   fundo #000000; fullscreen (borda/raio do card removidos a pedido)
 //
 // O trigger original é hover (enter/leave). Convertido para ciclo autónomo:
 //   appear (varrimento radial + shimmer) → hold → disappear (encolher 0.8 s,
@@ -132,12 +132,7 @@ final class UltracodePixelCardView: ScreenSaverView {
     private let presetSpeed: Double = 80          // → efetivo 0.16 via throttle 0.002
     private let durationMs: Double = 800          // transition.duration 0.8 s
     private let easeFn = cubicBezier(0, 0, 0.58, 1) // "easeOut"
-    private let cardRadius: CGFloat = 25
-    private let borderWidth: CGFloat = 1
     private let cardBackground = NSColor(srgbRed: 0, green: 0, blue: 0, alpha: 1)          // #000000
-    private let borderColor = NSColor(srgbRed: 0x27/255.0, green: 0x27/255.0, blue: 0x2a/255.0, alpha: 1) // #27272a
-    // Fundo do ecrã atrás do card (página escura; quase-preto para a borda/card lerem-se)
-    private let pageBackground = NSColor(srgbRed: 0x09/255.0, green: 0x09/255.0, blue: 0x0b/255.0, alpha: 1) // #09090b
     // Paleta do preset: rgba(255,255,255,1), rgba(255,255,255,0.8), rgba(255,255,255,0.6)
     private let paletteAlphas: [CGFloat] = [1.0, 0.8, 0.6]
 
@@ -176,12 +171,10 @@ final class UltracodePixelCardView: ScreenSaverView {
         if size == builtForSize && !pixels.isEmpty { return }
         builtForSize = size
 
-        // Enquadramento: card central ~60% do ecrã sobre fundo escuro.
-        let cw = floor(size.width * 0.6)
-        let ch = floor(size.height * 0.6)
-        cardRect = CGRect(x: ((size.width - cw) * 0.5).rounded(),
-                          y: ((size.height - ch) * 0.5).rounded(),
-                          width: cw, height: ch)
+        // Enquadramento: fullscreen — o efeito cobre o ecrã inteiro (sem card).
+        cardRect = CGRect(origin: .zero, size: size)
+        let cw = size.width
+        let ch = size.height
 
         let w = Double(cw), h = Double(ch)
         let effSpeed = min(max(presetSpeed, 0), 100) * 0.002   // getEffectiveSpeed
@@ -249,26 +242,11 @@ final class UltracodePixelCardView: ScreenSaverView {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
         rebuildIfNeeded()
 
-        // Página escura
-        ctx.setFillColor(pageBackground.cgColor)
+        // Fundo preto do efeito, ecrã inteiro
+        ctx.setFillColor(cardBackground.cgColor)
         ctx.fill(bounds)
 
-        // Card: fundo preto, raio 25, borda 1px #27272a
-        let cardPath = CGPath(roundedRect: cardRect, cornerWidth: cardRadius,
-                              cornerHeight: cardRadius, transform: nil)
-        ctx.addPath(cardPath)
-        ctx.setFillColor(cardBackground.cgColor)
-        ctx.fillPath()
-        ctx.addPath(cardPath)
-        ctx.setStrokeColor(borderColor.cgColor)
-        ctx.setLineWidth(borderWidth)
-        ctx.strokePath()
-
         guard !pixels.isEmpty else { return }
-
-        ctx.saveGState()
-        ctx.addPath(cardPath)
-        ctx.clip()
 
         // Agrupar rects por cor (3 passagens em vez de 1 setFill por píxel)
         var rectsByColor: [[CGRect]] = [[], [], []]
@@ -285,7 +263,6 @@ final class UltracodePixelCardView: ScreenSaverView {
             ctx.setFillColor(CGColor(srgbRed: 1, green: 1, blue: 1, alpha: alpha))
             ctx.fill(rectsByColor[i])
         }
-        ctx.restoreGState()
     }
 
     override func startAnimation() { super.startAnimation() }
