@@ -1,6 +1,10 @@
 import AppKit
 import ScreenSaver
 
+private extension Notification.Name {
+    static let globeConfigChanged = Notification.Name("UltracodeGlobeConfigChanged")
+}
+
 // UltracodeGlobe — faithful port of the originkit.dev "globe" web component
 // (preset `base`, three.js) to a native macOS screensaver.
 //
@@ -45,13 +49,102 @@ final class UltracodeGlobeView: ScreenSaverView {
     private let tubeWorldRadius: Double = 0.001   // (width/10)*0.01, width 1 (grid & outline)
     private let baseStep: Double = (24.0 + (7.0 / 9.0) * (8.0 - 24.0)) * 0.08 // 0.924444
 
-    private let graticuleColor = CGColor(red: 212.0 / 255.0, green: 212.0 / 255.0,
+    // Cores ativas (definidas por applyTheme; tema 0 = "Base" reproduz o original).
+    private var graticuleColor = CGColor(red: 212.0 / 255.0, green: 212.0 / 255.0,
                                          blue: 212.0 / 255.0, alpha: 1.0)   // #D4D4D4
-    private let outlineColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1) // #ffffff
-    private let dotColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)     // #ffffff
+    private var outlineColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1) // #ffffff
+    private var dotRGB: (Double, Double, Double) = (1, 1, 1)  // cor do splat dos dots
     private let oceanColor = CGColor(red: 0, green: 0, blue: 0, alpha: 1)   // #000000
+    // Marcador de posição é semântico: mantém-se verde em TODOS os temas.
     private let locationColor = CGColor(red: 0x30 / 255.0, green: 0xD1 / 255.0,
                                         blue: 0x58 / 255.0, alpha: 1)       // #30D158 (verde Apple)
+
+    // MARK: - Temas
+
+    // "Base" = cores originais do port; os restantes usam as MESMAS stops do
+    // UltracodeLife (frio -> quente). Mapeamento monocromático na família do
+    // tema: dots = stop quente (6-7), contornos = 5-6, graticule = frio (2-3).
+    private struct Theme {
+        let name: String
+        let stops: [UInt32]?   // nil = Base (branco / #D4D4D4)
+    }
+
+    private static let themes: [Theme] = [
+        Theme(name: "Base", stops: nil),
+        Theme(name: "Ultracode (lavanda)", stops: [
+            0x34313A, 0x3D3946, 0x56506B, 0x6F6590,
+            0x9C8FD0, 0xB9AEE8, 0xCFC6F2, 0xEEE9FB,
+        ]),
+        Theme(name: "Doom clássico", stops: [
+            0x3A322C, 0x571B08, 0x9F2A00, 0xD75F07,
+            0xF0A039, 0xFAD75C, 0xFFF3A0, 0xFFFFE6,
+        ]),
+        Theme(name: "Matrix", stops: [
+            0x303A33, 0x2F4D33, 0x2F6B3A, 0x32934A,
+            0x3FBF5F, 0x73E08C, 0xB6F2C2, 0xEFFFF2,
+        ]),
+    ]
+
+    private static func mix(_ a: UInt32, _ b: UInt32) -> (Double, Double, Double) {
+        func c(_ h: UInt32, _ s: UInt32) -> Double { Double((h >> s) & 0xFF) / 255.0 }
+        return ((c(a, 16) + c(b, 16)) / 2,
+                (c(a, 8) + c(b, 8)) / 2,
+                (c(a, 0) + c(b, 0)) / 2)
+    }
+
+    private func applyTheme() {
+        let theme = Self.themes[config.theme]
+        if let stops = theme.stops {
+            dotRGB = Self.mix(stops[6], stops[7])            // stop quente 6-7
+            let line = Self.mix(stops[5], stops[6])          // contornos 5-6
+            outlineColor = CGColor(red: line.0, green: line.1, blue: line.2, alpha: 1)
+            let grid = Self.mix(stops[2], stops[3])          // graticule frio 2-3
+            graticuleColor = CGColor(red: grid.0, green: grid.1, blue: grid.2, alpha: 1)
+        } else {
+            dotRGB = (1, 1, 1)
+            outlineColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+            graticuleColor = CGColor(red: 212.0 / 255.0, green: 212.0 / 255.0,
+                                     blue: 212.0 / 255.0, alpha: 1)
+        }
+    }
+
+    // MARK: - User configuration
+
+    private struct Config {
+        var theme = 0
+        var speed = 1.0          // multiplicador de rotationSpeed (0.25x-3x)
+        var showLocation = true  // marcador verde da posição atual
+        var density = 1.0        // multiplicador de baseStep (0.5x-2x)
+    }
+
+    private static let moduleName = "com.williansaez.ultracode-globe"
+
+    private static func makeDefaults() -> ScreenSaverDefaults? {
+        let d = ScreenSaverDefaults(forModuleWithName: moduleName)
+        d?.register(defaults: [
+            "theme": 0,
+            "speed": 1.0,
+            "showLocation": true,
+            "density": 1.0,
+        ])
+        return d
+    }
+
+    private var config = Config()
+    private var builtDensity = 1.0   // densidade com que dotUnits foi construído
+
+    private func loadConfig() {
+        guard let d = Self.makeDefaults() else { return }
+        config.theme = min(max(d.integer(forKey: "theme"), 0), Self.themes.count - 1)
+        config.speed = min(max(d.double(forKey: "speed"), 0.25), 3.0)
+        config.showLocation = d.bool(forKey: "showLocation")
+        config.density = min(max(d.double(forKey: "density"), 0.5), 2.0)
+        applyTheme()
+        if config.density != builtDensity, let rings = landRings {
+            dotUnits.removeAll(keepingCapacity: true)
+            buildDots(rings: rings)
+        }
+    }
 
     // MARK: - State
 
@@ -64,6 +157,7 @@ final class UltracodeGlobeView: ScreenSaverView {
     private var outlineRings: [[Double]] = []      // each: flattened x,y,z (closed)
     private var gridLines: [[Double]] = []         // graticule polylines
     private var locationUnit: (Double, Double, Double)? = nil  // posição atual (verde)
+    private var landRings: [LandRing]? = nil       // retidos para reconstruir dots
 
     // Reusable device-resolution splat buffer for the land dots (drawing ~7k
     // antialiased CGPath ellipses per frame is too slow; splatting analytic-AA
@@ -71,7 +165,10 @@ final class UltracodeGlobeView: ScreenSaverView {
     private var dotBuf: UnsafeMutablePointer<UInt8>? = nil
     private var dotBufSide: Int = 0
 
-    deinit { dotBuf?.deallocate() }
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+        dotBuf?.deallocate()
+    }
 
     // MARK: - Init
 
@@ -90,11 +187,17 @@ final class UltracodeGlobeView: ScreenSaverView {
         yaw = initialYaw
         targetYaw = initialYaw
         buildGraticule()
-        if let rings = loadLandRings() {
+        landRings = loadLandRings()
+        if let rings = landRings {
             buildContinentOutlines(rings: rings)
+        }
+        loadConfig()   // aplica tema e constrói dots com a densidade configurada
+        if dotUnits.isEmpty, let rings = landRings {
             buildDots(rings: rings)
         }
         locationUnit = Self.timezoneLocationUnit()
+        NotificationCenter.default.addObserver(self, selector: #selector(configChanged(_:)),
+                                               name: .globeConfigChanged, object: nil)
         NSLog("UltracodeGlobe: %d dots, %d outline rings, %d grid lines, location %@",
               dotUnits.count / 3, outlineRings.count, gridLines.count,
               locationUnit != nil ? "ok" : "indisponível")
@@ -142,8 +245,10 @@ final class UltracodeGlobeView: ScreenSaverView {
         return (lat, lng)
     }
 
-    override var hasConfigureSheet: Bool { false }
-    override var configureSheet: NSWindow? { nil }
+    @objc private func configChanged(_ note: Notification) {
+        loadConfig()
+        needsDisplay = true
+    }
 
     // MARK: - Land data loading
 
@@ -330,11 +435,13 @@ final class UltracodeGlobeView: ScreenSaverView {
             return buf[cy * w + x] > 128
         }
 
-        // Same dot grid as the reference.
+        // Same dot grid as the reference; step escalado pela densidade
+        // configurada (0.5x = mais denso, 2x = mais esparso).
+        let step = baseStep * config.density
         var lat = -90.0
         while lat <= 90.0 {
             let cosLat = cos(abs(lat) * Double.pi / 180.0)
-            let lngStep = cosLat > 0.01 ? baseStep / max(0.3, cosLat) : 360.0
+            let lngStep = cosLat > 0.01 ? step / max(0.3, cosLat) : 360.0
             var lng = -180.0
             while lng < 180.0 {
                 if isOnLand(lng: lng, lat: lat) {
@@ -343,8 +450,9 @@ final class UltracodeGlobeView: ScreenSaverView {
                 }
                 lng += lngStep
             }
-            lat += baseStep
+            lat += step
         }
+        builtDensity = config.density
     }
 
     // MARK: - Animation
@@ -352,7 +460,7 @@ final class UltracodeGlobeView: ScreenSaverView {
     override func animateOneFrame() {
         // Two 60 Hz substeps per 30 fps frame — matches the reference's rAF loop.
         for _ in 0..<2 {
-            targetYaw += rotationSpeed * 0.01
+            targetYaw += rotationSpeed * config.speed * 0.01
             yaw += (targetYaw - yaw) * lerpFactor
         }
         needsDisplay = true
@@ -455,6 +563,9 @@ final class UltracodeGlobeView: ScreenSaverView {
             guard let buf = dotBuf else { return }
             memset(buf, 0, side * side * 4)
 
+            // Cor do splat premultiplicada pelo tema (antes: branco hardcoded).
+            let dR = dotRGB.0, dG = dotRGB.1, dB = dotRGB.2
+
             var i = 0
             while i < dotUnits.count {
                 let (rx, ry, rz) = rotate(dotUnits[i], dotUnits[i + 1], dotUnits[i + 2])
@@ -476,11 +587,14 @@ final class UltracodeGlobeView: ScreenSaverView {
                         let dx = Double(px) + 0.5 - bx
                         let cov = r - (dx * dx + dy * dy).squareRoot() + 0.5
                         if cov > 0 {
-                            let v = UInt8(min(1.0, cov) * 255.0)
+                            let a = min(1.0, cov)
+                            let v = UInt8(a * 255.0)
                             let idx = (rowBase + px) * 4
                             if v > buf[idx + 3] {
-                                buf[idx] = v; buf[idx + 1] = v
-                                buf[idx + 2] = v; buf[idx + 3] = v   // premultiplied white
+                                buf[idx] = UInt8(a * dR * 255.0)     // premultiplied
+                                buf[idx + 1] = UInt8(a * dG * 255.0) // pela cor do tema
+                                buf[idx + 2] = UInt8(a * dB * 255.0)
+                                buf[idx + 3] = v
                             }
                         }
                         px += 1
@@ -503,7 +617,7 @@ final class UltracodeGlobeView: ScreenSaverView {
         }
 
         // Posição atual: bolinha verde por cima dos dots (mesma rotação/culling)
-        if let loc = locationUnit {
+        if config.showLocation, let loc = locationUnit {
             let (rx, ry, rz) = rotate(loc.0, loc.1, loc.2)
             if rz > zThreshold {
                 let (sx, syp, depth) = project(rx, ry, rz)
@@ -515,6 +629,121 @@ final class UltracodeGlobeView: ScreenSaverView {
         }
     }
 
-    override func startAnimation() { super.startAnimation() }
+    override func startAnimation() {
+        loadConfig()
+        super.startAnimation()
+    }
     override func stopAnimation() { super.stopAnimation() }
+
+    // MARK: - Configure sheet
+
+    private var sheet: NSPanel?
+    private var themePopup: NSPopUpButton?
+    private var speedSlider: NSSlider?
+    private var densitySlider: NSSlider?
+    private var locationCheck: NSButton?
+
+    override var hasConfigureSheet: Bool { true }
+
+    override var configureSheet: NSWindow? {
+        if let sheet { return sheet }
+        loadConfig()
+
+        // Frames fixos, zero Auto Layout: a sheet é medida e apresentada
+        // remotamente (legacyScreenSaver -> Definições do Sistema) antes de
+        // qualquer passagem de layout; painéis com autolayout colapsam aí.
+        let W: CGFloat = 440, H: CGFloat = 212
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: W, height: H),
+                            styleMask: [.titled],
+                            backing: .buffered, defer: false)
+        panel.title = "Globo"
+        panel.isReleasedWhenClosed = false
+
+        let content = panel.contentView!
+
+        func label(_ text: String, row y: CGFloat) -> NSTextField {
+            let l = NSTextField(labelWithString: text)
+            l.alignment = .right
+            l.frame = NSRect(x: 20, y: y, width: 150, height: 20)
+            content.addSubview(l)
+            return l
+        }
+        func slider(_ value: Double, _ minV: Double, _ maxV: Double,
+                    row y: CGFloat) -> NSSlider {
+            let s = NSSlider(value: value, minValue: minV, maxValue: maxV,
+                             target: nil, action: nil)
+            s.isContinuous = false
+            s.frame = NSRect(x: 180, y: y - 2, width: 240, height: 24)
+            content.addSubview(s)
+            return s
+        }
+
+        _ = label("Tema:", row: 164)
+        let popup = NSPopUpButton(frame: NSRect(x: 178, y: 158, width: 244, height: 26),
+                                  pullsDown: false)
+        popup.addItems(withTitles: Self.themes.map(\.name))
+        popup.selectItem(at: config.theme)
+        content.addSubview(popup)
+
+        _ = label("Velocidade de rotação:", row: 126)
+        let sSlider = slider(config.speed, 0.25, 3.0, row: 126)
+
+        _ = label("Densidade de pontos:", row: 88)
+        // Slider mostra "mais pontos à direita": inverte o multiplicador de
+        // baseStep (2x step = esquerda/esparso, 0.5x step = direita/denso).
+        let dSlider = slider(-config.density, -2.0, -0.5, row: 88)
+
+        let locCheck = NSButton(checkboxWithTitle: "Mostrar posição atual",
+                                target: nil, action: nil)
+        locCheck.state = config.showLocation ? .on : .off
+        locCheck.frame = NSRect(x: 180, y: 56, width: 248, height: 20)
+        content.addSubview(locCheck)
+
+        let cancel = NSButton(title: "Cancelar", target: self,
+                              action: #selector(sheetCancel(_:)))
+        cancel.bezelStyle = .rounded
+        cancel.frame = NSRect(x: W - 200, y: 12, width: 90, height: 30)
+        content.addSubview(cancel)
+
+        let ok = NSButton(title: "OK", target: self,
+                          action: #selector(sheetOK(_:)))
+        ok.bezelStyle = .rounded
+        ok.keyEquivalent = "\r"
+        ok.frame = NSRect(x: W - 102, y: 12, width: 82, height: 30)
+        content.addSubview(ok)
+
+        content.layoutSubtreeIfNeeded()
+
+        sheet = panel
+        themePopup = popup
+        speedSlider = sSlider
+        densitySlider = dSlider
+        locationCheck = locCheck
+        return panel
+    }
+
+    @objc private func sheetOK(_ sender: Any?) {
+        if let d = Self.makeDefaults() {
+            d.set(themePopup?.indexOfSelectedItem ?? 0, forKey: "theme")
+            d.set(speedSlider?.doubleValue ?? 1.0, forKey: "speed")
+            d.set(-(densitySlider?.doubleValue ?? -1.0), forKey: "density")
+            d.set(locationCheck?.state == .on, forKey: "showLocation")
+            d.synchronize()
+        }
+        NotificationCenter.default.post(name: .globeConfigChanged, object: nil)
+        closeSheet()
+    }
+
+    @objc private func sheetCancel(_ sender: Any?) {
+        closeSheet()
+    }
+
+    private func closeSheet() {
+        guard let sheet else { return }
+        if let parent = sheet.sheetParent {
+            parent.endSheet(sheet)
+        } else {
+            sheet.close()
+        }
+    }
 }
