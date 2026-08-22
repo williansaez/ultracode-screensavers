@@ -50,6 +50,8 @@ final class UltracodeGlobeView: ScreenSaverView {
     private let outlineColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1) // #ffffff
     private let dotColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)     // #ffffff
     private let oceanColor = CGColor(red: 0, green: 0, blue: 0, alpha: 1)   // #000000
+    private let locationColor = CGColor(red: 0x30 / 255.0, green: 0xD1 / 255.0,
+                                        blue: 0x58 / 255.0, alpha: 1)       // #30D158 (verde Apple)
 
     // MARK: - State
 
@@ -61,6 +63,7 @@ final class UltracodeGlobeView: ScreenSaverView {
     private var dotUnits: [Double] = []            // flattened x,y,z
     private var outlineRings: [[Double]] = []      // each: flattened x,y,z (closed)
     private var gridLines: [[Double]] = []         // graticule polylines
+    private var locationUnit: (Double, Double, Double)? = nil  // posição atual (verde)
 
     // Reusable device-resolution splat buffer for the land dots (drawing ~7k
     // antialiased CGPath ellipses per frame is too slow; splatting analytic-AA
@@ -91,8 +94,52 @@ final class UltracodeGlobeView: ScreenSaverView {
             buildContinentOutlines(rings: rings)
             buildDots(rings: rings)
         }
-        NSLog("UltracodeGlobe: %d dots, %d outline rings, %d grid lines",
-              dotUnits.count / 3, outlineRings.count, gridLines.count)
+        locationUnit = Self.timezoneLocationUnit()
+        NSLog("UltracodeGlobe: %d dots, %d outline rings, %d grid lines, location %@",
+              dotUnits.count / 3, outlineRings.count, gridLines.count,
+              locationUnit != nil ? "ok" : "indisponível")
+    }
+
+    // MARK: - Localização atual (sem permissões)
+
+    // Coordenadas da cidade do fuso horário atual, via /usr/share/zoneinfo/zone.tab
+    // (offline, sem CoreLocation — precisão de cidade chega para a malha de ~0.9°).
+    private static func timezoneLocationUnit() -> (Double, Double, Double)? {
+        let tzId = TimeZone.current.identifier
+        guard let content = try? String(contentsOfFile: "/usr/share/zoneinfo/zone.tab",
+                                        encoding: .utf8) else { return nil }
+        for line in content.split(separator: "\n") {
+            guard !line.hasPrefix("#") else { continue }
+            let cols = line.split(separator: "\t")
+            guard cols.count >= 3, cols[2] == Substring(tzId) else { continue }
+            guard let (lat, lng) = parseISO6709(String(cols[1])) else { return nil }
+            return unitPos(lat: lat, lng: lng)
+        }
+        return nil
+    }
+
+    // "±DDMM±DDDMM" ou "±DDMMSS±DDDMMSS" (formato do zone.tab)
+    private static func parseISO6709(_ s: String) -> (lat: Double, lng: Double)? {
+        let chars = Array(s)
+        guard chars.count > 1,
+              let split = (1..<chars.count).first(where: { chars[$0] == "+" || chars[$0] == "-" })
+        else { return nil }
+
+        func value(_ part: ArraySlice<Character>, degDigits: Int) -> Double? {
+            guard let first = part.first, first == "+" || first == "-" else { return nil }
+            let digits = String(part.dropFirst())
+            guard digits.count >= degDigits, digits.allSatisfy({ $0.isNumber }) else { return nil }
+            let deg = Double(digits.prefix(degDigits))!
+            var rest = digits.dropFirst(degDigits)
+            var minutes = 0.0, seconds = 0.0
+            if rest.count >= 2 { minutes = Double(rest.prefix(2))!; rest = rest.dropFirst(2) }
+            if rest.count >= 2 { seconds = Double(rest.prefix(2))! }
+            return (first == "-" ? -1.0 : 1.0) * (deg + minutes / 60.0 + seconds / 3600.0)
+        }
+
+        guard let lat = value(chars[0..<split], degDigits: 2),
+              let lng = value(chars[split...], degDigits: 3) else { return nil }
+        return (lat, lng)
     }
 
     override var hasConfigureSheet: Bool { false }
@@ -452,6 +499,18 @@ final class UltracodeGlobeView: ScreenSaverView {
                 ctx.interpolationQuality = .none
                 ctx.draw(image, in: CGRect(x: x0, y: y0, width: sideUser, height: sideUser))
                 ctx.interpolationQuality = q
+            }
+        }
+
+        // Posição atual: bolinha verde por cima dos dots (mesma rotação/culling)
+        if let loc = locationUnit {
+            let (rx, ry, rz) = rotate(loc.0, loc.1, loc.2)
+            if rz > zThreshold {
+                let (sx, syp, depth) = project(rx, ry, rz)
+                let r = CGFloat(dotWorldRadius * K / depth) * 1.8
+                ctx.setFillColor(locationColor)
+                ctx.fillEllipse(in: CGRect(x: sx - Double(r), y: syp - Double(r),
+                                           width: Double(r) * 2, height: Double(r) * 2))
             }
         }
     }
