@@ -195,8 +195,10 @@ public final class UltracodeLineRippleView: ScreenSaverView {
         }
         let stops = hexes.map(RGB.init)
         bucketColors = (0..<Self.bucketCount).map { b in
-            ramp((CGFloat(b) + 0.5) / CGFloat(Self.bucketCount), stops: stops)
-                .color.cgColor
+            // só a metade clara da ramp (0.4..1): os stops frios são quase pretos
+            // e criavam zonas escuras a mover-se com o campo
+            let t = 0.4 + 0.6 * (CGFloat(b) + 0.5) / CGFloat(Self.bucketCount)
+            return ramp(t, stops: stops).color.cgColor
         }
     }
 
