@@ -4,6 +4,11 @@ import Metal
 import QuartzCore
 import simd
 
+private extension Notification.Name {
+    static let particleSphereConfigChanged =
+        Notification.Name("UltracodeParticleSphereConfigChanged")
+}
+
 // MARK: - Ported constants (originkit.dev "particlesphere", preset `base`)
 //
 // Preset props (merged over component defaults):
@@ -30,9 +35,21 @@ import simd
 //   targetRotation.x += rotationSpeed * 0.1 * deltaFactor  (deltaFactor = dt/16.67ms)
 //   rotation.x += (target - rotation) * (1 - pow(1 - 0.141, deltaFactor))
 //   group.rotation.y = rotation.x   (three.js Y-axis rotation, clockwise preset)
+//
+// User configuration (ScreenSaverDefaults, module
+// "com.williansaez.ultracode-particlesphere"):
+//   theme        popup  - "Base" keeps the flat white particles; the themed
+//                         options color each particle by its ROTATED depth
+//                         (back of sphere = cold ramp stop, front = hot stop),
+//                         giving the sphere painted volumetry. With additive
+//                         blending overlapping particles saturate toward hot.
+//   speed        slider - 0.25x..3x multiplier on rotationSpeed (default 1x)
+//   particles    slider - 2000..20000 (default 10000); the Fibonacci
+//                         distribution is regenerated on change
+//   particleSize slider - 0.5x..2x multiplier on particle radius (default 1x)
 
 private enum Ref {
-    static let particlesCount = 10_000
+    static let particlesCount = 10_000                      // default (user 2000..20000)
     static let rotationSpeed: Float = 0.0944444444          // speed=20 preset
     static let lerpFactor: Float = 0.141                    // smoothing=7
     static let sphereRadius: Float = 1.25                   // scale=10
@@ -53,12 +70,18 @@ struct Uniforms {
     float4x4 projection;
     float    pointScale;   // drawableHeightPx / (2 * tan(fov/2))
     float    radius;       // particle world radius
-    float2   pad;
+    float    cameraZ;      // camera distance (recovers rotated model-space z)
+    float    sphereRadius; // sphere radius, normalizes the depth ramp
+    float    useRamp;      // 0 = flat white (Base), 1 = themed depth ramp
+    float    pad0;
+    float2   pad1;
+    float4   stops[8];     // theme ramp, cold (back) -> hot (front)
 };
 
 struct VOut {
     float4 position  [[position]];
     float  pointSize [[point_size]];
+    float3 color;
 };
 
 vertex VOut psphere_vertex(uint vid [[vertex_id]],
@@ -71,6 +94,20 @@ vertex VOut psphere_vertex(uint vid [[vertex_id]],
     float dist = max(0.0001, -viewPos.z);
     // Projected diameter in pixels of a sphere of radius u.radius at this depth.
     o.pointSize = clamp(2.0 * u.radius * u.pointScale / dist, 0.75, 500.0);
+    if (u.useRamp > 0.5) {
+        // Rotated depth: viewPos.z + cameraZ is the particle's z after the
+        // model rotation, in [-sphereRadius, +sphereRadius]. Back of the
+        // sphere maps to the cold end of the ramp, front (facing the camera)
+        // to the hot end - painted volumetry. Additive blending then
+        // saturates overlaps toward the hot stop.
+        float modelZ = viewPos.z + u.cameraZ;
+        float t = clamp(modelZ / u.sphereRadius * 0.5 + 0.5, 0.0, 1.0);
+        float x = t * 7.0;
+        int i = min(int(x), 6);
+        o.color = mix(u.stops[i].rgb, u.stops[i + 1].rgb, x - float(i));
+    } else {
+        o.color = float3(1.0);   // Base: sphereColor #FFFFFF, as shipped
+    }
     return o;
 }
 
@@ -81,8 +118,8 @@ fragment float4 psphere_fragment(VOut in [[stage_in]],
     // reference's MSAA'd low-poly sphere geometry).
     float alpha = 1.0 - smoothstep(0.8, 1.0, r);
     if (alpha <= 0.0) discard_fragment();
-    // sphereColor #FFFFFF, opacity 1, additive blending (premultiplied).
-    return float4(alpha, alpha, alpha, alpha);
+    // Opacity 1, additive blending (premultiplied).
+    return float4(in.color * alpha, alpha);
 }
 """
 
@@ -94,38 +131,38 @@ final class ParticleSphereRenderer {
         var projection: simd_float4x4
         var pointScale: Float
         var radius: Float
-        var pad: SIMD2<Float> = .zero
+        var cameraZ: Float
+        var sphereRadius: Float
+        var useRamp: Float
+        var pad0: Float = 0
+        var pad1: SIMD2<Float> = .zero
+        var stops: (SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>,
+                    SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>)
     }
 
     let device: MTLDevice
     private let queue: MTLCommandQueue
     private let pipeline: MTLRenderPipelineState
-    private let positionBuffer: MTLBuffer
+    private var positionBuffer: MTLBuffer
+    private(set) var particleCount: Int
+
+    // User configuration (pushed by the view from ScreenSaverDefaults).
+    var speedMultiplier: Float = 1.0     // 0.25x..3x on rotation speed
+    var sizeMultiplier: Float = 1.0      // 0.5x..2x on particle radius
+    var rampStops: [SIMD4<Float>]?       // 8 stops cold->hot; nil = Base (white)
 
     // Rotation state, mirroring the reference exactly.
     private var rotationX: Float = 0        // lerped angle actually applied
     private var targetRotationX: Float = 0  // advanced by the auto-rotation
 
-    init?(device: MTLDevice) {
+    init?(device: MTLDevice, particleCount: Int = Ref.particlesCount) {
         self.device = device
         guard let queue = device.makeCommandQueue() else { return nil }
         self.queue = queue
 
-        // Fibonacci sphere distribution - identical math to the reference.
-        let n = Ref.particlesCount
-        let goldenAngle = Float.pi * (3.0 - sqrtf(5.0))
-        var verts = [Float](repeating: 0, count: n * 3)
-        for i in 0..<n {
-            let y = 1.0 - (Float(i) / Float(n - 1)) * 2.0   // 1 -> -1
-            let ringRadius = sqrtf(max(0, 1.0 - y * y))
-            let theta = goldenAngle * Float(i)
-            verts[i * 3 + 0] = cosf(theta) * ringRadius * Ref.sphereRadius
-            verts[i * 3 + 1] = y * Ref.sphereRadius
-            verts[i * 3 + 2] = sinf(theta) * ringRadius * Ref.sphereRadius
-        }
-        guard let buf = device.makeBuffer(bytes: verts,
-                                          length: verts.count * MemoryLayout<Float>.size,
-                                          options: .storageModeShared) else { return nil }
+        let n = max(2, particleCount)
+        self.particleCount = n
+        guard let buf = Self.makeFibonacciBuffer(device: device, count: n) else { return nil }
         self.positionBuffer = buf
 
         do {
@@ -150,11 +187,37 @@ final class ParticleSphereRenderer {
         }
     }
 
+    /// Fibonacci sphere distribution - identical math to the reference.
+    private static func makeFibonacciBuffer(device: MTLDevice, count n: Int) -> MTLBuffer? {
+        let goldenAngle = Float.pi * (3.0 - sqrtf(5.0))
+        var verts = [Float](repeating: 0, count: n * 3)
+        for i in 0..<n {
+            let y = 1.0 - (Float(i) / Float(n - 1)) * 2.0   // 1 -> -1
+            let ringRadius = sqrtf(max(0, 1.0 - y * y))
+            let theta = goldenAngle * Float(i)
+            verts[i * 3 + 0] = cosf(theta) * ringRadius * Ref.sphereRadius
+            verts[i * 3 + 1] = y * Ref.sphereRadius
+            verts[i * 3 + 2] = sinf(theta) * ringRadius * Ref.sphereRadius
+        }
+        return device.makeBuffer(bytes: verts,
+                                 length: verts.count * MemoryLayout<Float>.size,
+                                 options: .storageModeShared)
+    }
+
+    /// Regenerate the Fibonacci distribution when the particle count changes.
+    func setParticleCount(_ n: Int) {
+        let clamped = max(2, n)
+        guard clamped != particleCount,
+              let buf = Self.makeFibonacciBuffer(device: device, count: clamped) else { return }
+        positionBuffer = buf
+        particleCount = clamped
+    }
+
     /// Advance the simulation by `dt` seconds (reference's delta-time model).
     func advance(deltaSeconds dt: Double) {
         let deltaFactor = Float((dt * 1000.0) / Ref.targetDeltaMs)
         // Auto-rotation: targetRotation.x += rotationSpeed * 0.1 * deltaFactor
-        targetRotationX += Ref.rotationSpeed * 0.1 * deltaFactor
+        targetRotationX += Ref.rotationSpeed * speedMultiplier * 0.1 * deltaFactor
         // Lerp toward target: 1 - pow(1 - lerpFactor, deltaFactor)
         let t = 1.0 - powf(1.0 - Ref.lerpFactor, deltaFactor)
         rotationX += (targetRotationX - rotationX) * t
@@ -174,7 +237,7 @@ final class ParticleSphereRenderer {
 
         var u = makeUniforms(widthPx: Float(texture.width), heightPx: Float(texture.height))
         enc.setVertexBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 1)
-        enc.drawPrimitives(type: .point, vertexStart: 0, vertexCount: Ref.particlesCount)
+        enc.drawPrimitives(type: .point, vertexStart: 0, vertexCount: particleCount)
         enc.endEncoding()
     }
 
@@ -223,10 +286,20 @@ final class ParticleSphereRenderer {
         ))
 
         let pointScale = heightPx / (2.0 * tanf(fov / 2))
+
+        let white = SIMD4<Float>(repeating: 1)
+        var st = [SIMD4<Float>](repeating: white, count: 8)
+        if let ramp = rampStops, ramp.count == 8 { st = ramp }
+
         return Uniforms(modelView: modelView,
                         projection: projection,
                         pointScale: pointScale,
-                        radius: Ref.particleRadius)
+                        radius: Ref.particleRadius * sizeMultiplier,
+                        cameraZ: Ref.cameraZ,
+                        sphereRadius: Ref.sphereRadius,
+                        useRamp: rampStops == nil ? 0 : 1,
+                        stops: (st[0], st[1], st[2], st[3],
+                                st[4], st[5], st[6], st[7]))
     }
 }
 
@@ -234,9 +307,88 @@ final class ParticleSphereRenderer {
 
 @objc(UltracodeParticleSphereView)
 public final class UltracodeParticleSphereView: ScreenSaverView {
-    private var renderer: ParticleSphereRenderer?
+    // Internal (not private) so the offscreen test harness, compiled into the
+    // same module, can render frames without a window.
+    var renderer: ParticleSphereRenderer?
     private var metalLayer: CAMetalLayer?
     private var lastFrameTime: CFTimeInterval = 0
+
+    // MARK: - Themes
+
+    private struct Theme {
+        let name: String
+        let stops: [UInt32]?   // 8 stops cold -> hot; nil = flat white (Base)
+    }
+
+    /// "Base" keeps today's flat white particles. The themed ramps share
+    /// their stops with the other Ultracode savers (UltracodeLifeView).
+    private static let themes: [Theme] = [
+        Theme(name: "Base", stops: nil),
+        Theme(name: "Ultracode (lavanda)", stops: [
+            0x34313A, 0x3D3946, 0x56506B, 0x6F6590,
+            0x9C8FD0, 0xB9AEE8, 0xCFC6F2, 0xEEE9FB,
+        ]),
+        Theme(name: "Doom clássico", stops: [
+            0x3A322C, 0x571B08, 0x9F2A00, 0xD75F07,
+            0xF0A039, 0xFAD75C, 0xFFF3A0, 0xFFFFE6,
+        ]),
+        Theme(name: "Matrix", stops: [
+            0x303A33, 0x2F4D33, 0x2F6B3A, 0x32934A,
+            0x3FBF5F, 0x73E08C, 0xB6F2C2, 0xEFFFF2,
+        ]),
+    ]
+
+    private static func rampVectors(_ stops: [UInt32]) -> [SIMD4<Float>] {
+        stops.map { hex in
+            SIMD4<Float>(Float((hex >> 16) & 0xFF) / 255,
+                         Float((hex >> 8) & 0xFF) / 255,
+                         Float(hex & 0xFF) / 255,
+                         1)
+        }
+    }
+
+    // MARK: - User configuration
+
+    private struct Config {
+        var theme = 0
+        var speed: Double = 1.0              // 0.25x .. 3x rotation speed
+        var particles = Ref.particlesCount   // 2000 .. 20000
+        var size: Double = 1.0               // 0.5x .. 2x particle size
+    }
+
+    private static let moduleName = "com.williansaez.ultracode-particlesphere"
+
+    private static func makeDefaults() -> ScreenSaverDefaults? {
+        let d = ScreenSaverDefaults(forModuleWithName: moduleName)
+        d?.register(defaults: [
+            "theme": 0,
+            "speed": 1.0,
+            "particles": Ref.particlesCount,
+            "particleSize": 1.0,
+        ])
+        return d
+    }
+
+    private var config = Config()
+
+    private func loadConfig() {
+        guard let d = Self.makeDefaults() else { return }
+        config.theme = min(max(d.integer(forKey: "theme"), 0), Self.themes.count - 1)
+        config.speed = min(max(d.double(forKey: "speed"), 0.25), 3.0)
+        config.particles = min(max(d.integer(forKey: "particles"), 2000), 20_000)
+        config.size = min(max(d.double(forKey: "particleSize"), 0.5), 2.0)
+        applyConfig()
+    }
+
+    private func applyConfig() {
+        guard let renderer else { return }
+        renderer.speedMultiplier = Float(config.speed)
+        renderer.sizeMultiplier = Float(config.size)
+        renderer.rampStops = Self.themes[config.theme].stops.map(Self.rampVectors)
+        renderer.setParticleCount(config.particles)   // regenerates Fibonacci
+    }
+
+    // MARK: - Lifecycle
 
     public override init?(frame: NSRect, isPreview: Bool) {
         super.init(frame: frame, isPreview: isPreview)
@@ -246,6 +398,10 @@ public final class UltracodeParticleSphereView: ScreenSaverView {
     public required init?(coder: NSCoder) {
         super.init(coder: coder)
         commonInit()
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
     }
 
     private func commonInit() {
@@ -265,12 +421,19 @@ public final class UltracodeParticleSphereView: ScreenSaverView {
         ml.isOpaque = true
         ml.backgroundColor = NSColor.black.cgColor
         self.metalLayer = ml
+
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(configChanged(_:)),
+            name: .particleSphereConfigChanged, object: nil)
     }
 
-    public override var hasConfigureSheet: Bool { false }
+    @objc private func configChanged(_ note: Notification) {
+        loadConfig()
+    }
 
     public override func startAnimation() {
         super.startAnimation()
+        loadConfig()
         lastFrameTime = 0
     }
 
@@ -326,5 +489,113 @@ public final class UltracodeParticleSphereView: ScreenSaverView {
         // Black fill behind the Metal layer (and fallback if Metal is absent).
         NSColor.black.setFill()
         rect.fill()
+    }
+
+    // MARK: - Configure sheet
+
+    private var sheet: NSPanel?
+    private var themePopup: NSPopUpButton?
+    private var speedSlider: NSSlider?
+    private var particlesSlider: NSSlider?
+    private var sizeSlider: NSSlider?
+
+    public override var hasConfigureSheet: Bool { true }
+
+    public override var configureSheet: NSWindow? {
+        if let sheet { return sheet }
+        loadConfig()
+
+        // Fixed frames, no autolayout: the sheet is measured and presented
+        // remotely (legacyScreenSaver -> System Settings) before any layout
+        // pass runs; autolayout-sized panels collapse there.
+        let W: CGFloat = 440, H: CGFloat = 216
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: W, height: H),
+                            styleMask: [.titled],
+                            backing: .buffered, defer: false)
+        panel.title = "Esfera de Partículas"
+        panel.isReleasedWhenClosed = false
+
+        let content = panel.contentView!
+
+        func label(_ text: String, row y: CGFloat) -> NSTextField {
+            let l = NSTextField(labelWithString: text)
+            l.alignment = .right
+            l.frame = NSRect(x: 20, y: y, width: 150, height: 20)
+            content.addSubview(l)
+            return l
+        }
+        func slider(_ value: Double, _ minV: Double, _ maxV: Double,
+                    row y: CGFloat) -> NSSlider {
+            let s = NSSlider(value: value, minValue: minV, maxValue: maxV,
+                             target: nil, action: nil)
+            s.isContinuous = false
+            s.frame = NSRect(x: 180, y: y - 2, width: 240, height: 24)
+            content.addSubview(s)
+            return s
+        }
+
+        _ = label("Tema:", row: 168)
+        let popup = NSPopUpButton(frame: NSRect(x: 178, y: 162, width: 244, height: 26),
+                                  pullsDown: false)
+        popup.addItems(withTitles: Self.themes.map(\.name))
+        popup.selectItem(at: config.theme)
+        content.addSubview(popup)
+
+        _ = label("Velocidade de rotação:", row: 130)
+        let sSlider = slider(config.speed, 0.25, 3.0, row: 130)
+
+        _ = label("Nº de partículas:", row: 96)
+        let pSlider = slider(Double(config.particles), 2000, 20_000, row: 96)
+
+        _ = label("Tamanho das partículas:", row: 62)
+        let szSlider = slider(config.size, 0.5, 2.0, row: 62)
+
+        let cancel = NSButton(title: "Cancelar", target: self,
+                              action: #selector(sheetCancel(_:)))
+        cancel.bezelStyle = .rounded
+        cancel.frame = NSRect(x: W - 200, y: 12, width: 90, height: 30)
+        content.addSubview(cancel)
+
+        let ok = NSButton(title: "OK", target: self,
+                          action: #selector(sheetOK(_:)))
+        ok.bezelStyle = .rounded
+        ok.keyEquivalent = "\r"
+        ok.frame = NSRect(x: W - 102, y: 12, width: 82, height: 30)
+        content.addSubview(ok)
+
+        content.layoutSubtreeIfNeeded()
+
+        sheet = panel
+        themePopup = popup
+        speedSlider = sSlider
+        particlesSlider = pSlider
+        sizeSlider = szSlider
+        return panel
+    }
+
+    @objc private func sheetOK(_ sender: Any?) {
+        if let d = Self.makeDefaults() {
+            d.set(themePopup?.indexOfSelectedItem ?? 0, forKey: "theme")
+            d.set(speedSlider?.doubleValue ?? 1.0, forKey: "speed")
+            let count = Int((particlesSlider?.doubleValue ?? Double(Ref.particlesCount)).rounded())
+            d.set(count, forKey: "particles")
+            d.set(sizeSlider?.doubleValue ?? 1.0, forKey: "particleSize")
+            d.synchronize()
+        }
+        NotificationCenter.default.post(name: .particleSphereConfigChanged, object: nil)
+        closeSheet()
+    }
+
+    @objc private func sheetCancel(_ sender: Any?) {
+        closeSheet()
+    }
+
+    private func closeSheet() {
+        guard let sheet else { return }
+        if let parent = sheet.sheetParent {
+            parent.endSheet(sheet)
+        } else {
+            sheet.close()
+        }
     }
 }
