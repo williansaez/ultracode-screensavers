@@ -58,6 +58,7 @@ final class GalleryDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             case 53:  NSApp.terminate(nil)      // Esc
             case 123: self.show(self.idx - 1)   // ←
             case 124: self.show(self.idx + 1)   // →
+            case 8:   self.openConfig()         // C
             default:  return e
             }
             return nil
@@ -92,11 +93,23 @@ final class GalleryDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         view.autoresizingMask = [.width, .height]
         win.contentView = view
         current = view
-        win.title = "\(idx+1)/\(n)  \(name)   ←→ muda · Esc sai"
+        win.title = "\(idx+1)/\(n)  \(name)   ←→ muda · C config · Esc sai"
         view.startAnimation()
         frameTimer = Timer.scheduledTimer(withTimeInterval: view.animationTimeInterval, repeats: true) { _ in
             view.animateOneFrame()
             view.needsDisplay = true
+        }
+    }
+
+    func openConfig() {
+        guard let view = current, view.hasConfigureSheet,
+              let sheet = view.configureSheet else { NSSound.beep(); return }
+        // pausa a animação enquanto a folha está aberta
+        frameTimer?.invalidate()
+        win.beginSheet(sheet) { [weak self] _ in
+            guard let self else { return }
+            // re-instancia o saver: recarrega os defaults gravados pela folha
+            self.show(self.idx)
         }
     }
 
