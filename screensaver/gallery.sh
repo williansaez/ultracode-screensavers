@@ -54,6 +54,8 @@ final class GalleryDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
             guard let self else { return e }
+            // folha de configuração aberta: deixa o Esc/teclas para a sheet
+            if self.win.attachedSheet != nil { return e }
             switch e.keyCode {
             case 53:  NSApp.terminate(nil)      // Esc
             case 123: self.show(self.idx - 1)   // ←
