@@ -83,7 +83,12 @@ private final class PCPixel {
             if growStart == nil { growStart = now }
             let p = durationMs > 0 ? min(1, (now - growStart!) / durationMs) : 1
             size = ease(p) * maxSize
-            if p >= 1 { isShimmer = true }
+            if p >= 1 {
+                isShimmer = true
+                // fase inicial aleatória: mata a coerência radial (pulso) — twinkle puro
+                size = Double.random(in: minSize...maxSize)
+                isReverse = Bool.random()
+            }
         }
         if isShimmer { shimmer() }
     }
