@@ -11,8 +11,8 @@
 //   fundo #000000; fullscreen (borda/raio do card removidos a pedido)
 //
 // O trigger original é hover (enter/leave). Convertido para ciclo autónomo:
-//   appear (varrimento radial + shimmer) → hold → disappear (encolher 0.8 s,
-//   simultâneo, como no leave original) → pausa → repete.
+//   appear (varrimento radial) e depois shimmer perpétuo — sem disappear/pausa
+//   (ciclo removido a pedido; o hover leave do original não é replicado).
 
 import ScreenSaver
 import AppKit
@@ -56,12 +56,9 @@ private final class PCPixel {
     let delay: Double
     var counter: Double = 0
     let counterStep: Double
-    var isIdle = false
     var isReverse = false
     var isShimmer = false
     var growStart: Double? = nil
-    var shrinkStart: Double? = nil
-    var shrinkFrom: Double = 0
 
     init(canvasW: Double, canvasH: Double, x: Double, y: Double,
          colorIndex: Int, speed: Double, delay: Double, maxPx: Double) {
@@ -78,8 +75,6 @@ private final class PCPixel {
     }
 
     func appear(now: Double, durationMs: Double, ease: (Double) -> Double) {
-        isIdle = false
-        shrinkStart = nil
         if counter <= delay {
             counter += counterStep
             return
@@ -91,24 +86,6 @@ private final class PCPixel {
             if p >= 1 { isShimmer = true }
         }
         if isShimmer { shimmer() }
-    }
-
-    func disappear(now: Double, durationMs: Double, ease: (Double) -> Double) {
-        isShimmer = false
-        counter = 0
-        growStart = nil
-        if size <= 0 {
-            isIdle = true
-            shrinkStart = nil
-            return
-        }
-        if shrinkStart == nil {
-            shrinkStart = now
-            shrinkFrom = size
-        }
-        let p = durationMs > 0 ? min(1, (now - shrinkStart!) / durationMs) : 1
-        size = shrinkFrom * (1 - ease(p))
-        if p >= 1 { size = 0 }
     }
 
     private func shimmer() {
@@ -136,13 +113,7 @@ final class UltracodePixelCardView: ScreenSaverView {
     // Paleta do preset: rgba(255,255,255,1), rgba(255,255,255,0.8), rgba(255,255,255,0.6)
     private let paletteAlphas: [CGFloat] = [1.0, 0.8, 0.6]
 
-    // Ciclo autónomo (substitui hover enter/leave)
-    private enum Phase { case appear, disappear, pause }
-    private let appearHoldMs: Double = 7600   // enter → shimmer até aqui
-    private let pauseMs: Double = 1400        // card vazio antes de repetir
-
-    private var phase: Phase = .appear
-    private var phaseStartMs: Double = 0
+    // Sem ciclo: aparece uma vez (varrimento radial) e fica em shimmer perpétuo.
     private var nowMs: Double = 0             // relógio de simulação (1000/60 por frame)
 
     private var pixels: [PCPixel] = []
@@ -199,8 +170,6 @@ final class UltracodePixelCardView: ScreenSaverView {
             x += gap
         }
         pixels = pxs
-        phase = .appear
-        phaseStartMs = nowMs
     }
 
     // MARK: animação
@@ -210,29 +179,7 @@ final class UltracodePixelCardView: ScreenSaverView {
         rebuildIfNeeded()
         guard !pixels.isEmpty else { return }
 
-        switch phase {
-        case .appear:
-            for p in pixels { p.appear(now: nowMs, durationMs: durationMs, ease: easeFn) }
-            if nowMs - phaseStartMs >= appearHoldMs {
-                phase = .disappear
-                phaseStartMs = nowMs
-            }
-        case .disappear:
-            var allIdle = true
-            for p in pixels {
-                p.disappear(now: nowMs, durationMs: durationMs, ease: easeFn)
-                if !p.isIdle { allIdle = false }
-            }
-            if allIdle {
-                phase = .pause
-                phaseStartMs = nowMs
-            }
-        case .pause:
-            if nowMs - phaseStartMs >= pauseMs {
-                phase = .appear
-                phaseStartMs = nowMs
-            }
-        }
+        for p in pixels { p.appear(now: nowMs, durationMs: durationMs, ease: easeFn) }
         setNeedsDisplay(bounds)
     }
 
