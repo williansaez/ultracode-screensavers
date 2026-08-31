@@ -1,3 +1,7 @@
+<a href="https://www.buymeacoffee.com/williansaez" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" style="height: 60px !important;width: 217px !important;" ></a>
+
+![License](https://img.shields.io/badge/license-MIT-green)
+
 # Ultracode Screensavers
 
 Suite de **22 screensavers nativos para macOS** em duas famílias:
@@ -216,3 +220,4 @@ Cada saver tem um harness offline que instancia a view, bombeia frames e grava P
 - Na suite ultracode tudo é desenhado em células exatas da malha — nada de posições contínuas sobrepostas à grelha. (As réplicas originkit não seguem a grelha: reproduzem o rendering do componente original, incluindo Metal onde a referência usa WebGL.)
 - Interações de rato dos componentes originais (hover, drag) foram substituídas por ciclos autónomos mantendo a física — um screensaver termina ao primeiro toque no rato.
 - A posição do Globo vem de `/usr/share/zoneinfo/zone.tab` (cidade do fuso horário): offline, sem CoreLocation nem prompts de privacidade dentro do saver.
+
